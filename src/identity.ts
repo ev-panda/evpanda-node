@@ -77,8 +77,8 @@ function resolveInput<Ctx, I extends AnyIdentity>(
   if (input === undefined) return null;
   if (typeof input === "function") {
     try {
-      // Narrow the value|callback union: only the resolver is callable.
-      return (input as IdentityResolver<Ctx, I>)(ctx) ?? null;
+      // typeof check narrowed the value|callback union: only the resolver is callable.
+      return input(ctx) ?? null;
     } catch {
       return null;
     }

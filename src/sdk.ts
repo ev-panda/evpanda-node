@@ -59,8 +59,12 @@ class ActiveSDK implements SdkImpl {
 
 /** Inert twin: every method a no-op. #impl is this when the SDK is off. */
 class NoopSDK implements SdkImpl {
-  captureOCPI(): void {}
-  captureOCPP(): void {}
+  captureOCPI(): void {
+    /* no-op: SDK disabled */
+  }
+  captureOCPP(): void {
+    /* no-op: SDK disabled */
+  }
   flush(): Promise<void> {
     return Promise.resolve();
   }

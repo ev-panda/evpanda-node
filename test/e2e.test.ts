@@ -13,7 +13,7 @@ import type { OCPIMessage } from "../dist/index.js";
 interface Received {
   path: string;
   headers: http.IncomingHttpHeaders;
-  records: Array<Record<string, unknown>>;
+  records: Record<string, unknown>[];
 }
 
 interface MockUpstream {
@@ -34,7 +34,7 @@ function startMockUpstream(): Promise<MockUpstream> {
     req.on("end", () => {
       let buf = Buffer.concat(chunks);
       if (req.headers["content-encoding"] === "gzip") buf = gunzipSync(buf);
-      let records: Array<Record<string, unknown>> = [];
+      let records: Record<string, unknown>[] = [];
       try {
         const parsed: unknown = JSON.parse(buf.toString("utf8"));
         if (Array.isArray(parsed)) records = parsed;
