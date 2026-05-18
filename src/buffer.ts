@@ -42,7 +42,11 @@ export class RingBuffer {
     const out: BufferedMessage[] = new Array<BufferedMessage>(this._count);
     for (let i = 0; i < this._count; i++) {
       const idx = (this._head + i) % this._capacity;
-      out[i] = this._buf[idx]!; // live by invariant: [head, head+count)
+      const msg = this._buf[idx];
+      if (msg === undefined) {
+        throw new Error(`Invariant violation: expected BufferedMessage at buffer index ${idx}`);
+      }
+      out[i] = msg;
       this._buf[idx] = undefined; // release ref
     }
     this._head = 0;

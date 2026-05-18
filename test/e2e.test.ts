@@ -251,18 +251,18 @@ describe("EVPanda e2e", () => {
 
     // Capture during a failing upstream — must not throw.
     for (let i = 0; i < 3; i++) {
-      expect(() => sdk!.captureOCPI(makeOCPI(i))).not.toThrow();
+      expect(() => sdk?.captureOCPI(makeOCPI(i))).not.toThrow();
     }
     // Malformed customer input — must not throw either (proxy swallows).
-    expect(() => sdk!.captureOCPI(undefined as never)).not.toThrow();
-    expect(() => sdk!.captureOCPI({} as never)).not.toThrow();
+    expect(() => sdk?.captureOCPI(undefined as never)).not.toThrow();
+    expect(() => sdk?.captureOCPI({} as never)).not.toThrow();
 
     // flush() resolves (never rejects) even though the upstream 400s.
     await expect(sdk.flush()).resolves.toBeUndefined();
     expect(mock.received.length).toBeGreaterThan(0); // it did attempt
 
     // The SDK is still usable afterwards.
-    expect(() => sdk!.captureOCPI(makeOCPI(99))).not.toThrow();
+    expect(() => sdk?.captureOCPI(makeOCPI(99))).not.toThrow();
     await expect(sdk.flush()).resolves.toBeUndefined();
   });
 });
