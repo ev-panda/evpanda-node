@@ -1,0 +1,57 @@
+# Publishes @evpanda/sdk to npm when a GitHub Release is published.
+#
+# Prerequisites (one-time):
+#   - Repo secret NPM_TOKEN: an npm automation token with publish rights
+#     to the @evpanda scope.
+#   - Bump "version" in package.json before tagging/releasing (npm rejects
+#     re-publishing the same version; 0.0.0 is a placeholder).
+#
+# Publishes with provenance (supply-chain attestation) — needs
+# id-token: write and a public scoped package (--access public).
+
+name: Release
+
+on:
+  release:
+    types: [published]
+  # Manual run from the Actions tab (publishes the version in package.json;
+  # npm rejects re-publishing an existing version, so bump it first).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      # Fail fast (before checkout/install/test) if the publish token is
+      # missing — secrets can't be used in a job-level `if`, so guard here.
+      - name: Require NPM_TOKEN
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not set — cannot publish. Add it in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm install --no-audit --no-fund
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # prepublishOnly (clean + build) runs automatically before publish.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

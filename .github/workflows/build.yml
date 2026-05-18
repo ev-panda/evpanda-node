@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines: node >= 18. Test the supported LTS range.
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          # No `cache: npm` and no `npm ci`: the repo is intentionally
+          # manager-agnostic and commits no lockfile (see .gitignore).
+
+      - run: npm install --no-audit --no-fund
+
+      - run: npm run typecheck
+
+      # `npm test` runs `pretest` (tsup build) then vitest (the e2e suite
+      # imports the built dist), so this exercises build + dual-format output
+      # + the full capture→batch→upstream pipeline.
+      - run: npm test
+
+      - name: Build distribution
+        run: npm run build
