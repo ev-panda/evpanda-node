@@ -1,12 +1,19 @@
-# Publishes @evpanda/sdk to npm when a GitHub Release is published.
+# Publishes @evpanda/sdk to npm AND JSR when a GitHub Release is published.
+#
+# Two independent registries (see jsr.json vs package.json):
+#   - npm:  classic `npm add @evpanda/sdk`            (tsup dist/ dual build)
+#   - JSR:  `deno add jsr:@evpanda/sdk` / `jsr add`   (source .ts, transpiled)
 #
 # Prerequisites (one-time):
 #   - Repo secret NPM_TOKEN: an npm automation token with publish rights
 #     to the @evpanda scope.
-#   - Bump "version" in package.json before tagging/releasing (npm rejects
-#     re-publishing the same version; 0.0.0 is a placeholder).
+#   - JSR: the @evpanda scope + this repo linked on jsr.io. JSR publishes
+#     via GitHub OIDC (id-token: write) — no token/secret required.
+#   - Bump "version" in BOTH package.json and jsr.json before tagging;
+#     both registries reject re-publishing an existing version. The jsr
+#     job guards against the two drifting apart.
 #
-# Publishes with provenance (supply-chain attestation) — needs
+# npm publishes with provenance (supply-chain attestation) — needs
 # id-token: write and a public scoped package (--access public).
 
 name: Release
@@ -57,3 +64,38 @@ jobs:
       - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-jsr:
+    name: Publish (JSR)
+    runs-on: ubuntu-latest
+    # Independent of the npm job: a failure on one registry must not
+    # silently skip the other. Both gate on the same lint/typecheck/test.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm install --no-audit --no-fund
+
+      # jsr.json and package.json carry the version separately; a release
+      # that bumped only one would publish mismatched versions. Fail loud.
+      - name: Require jsr.json / package.json version parity
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          JSR=$(node -p "require('./jsr.json').version")
+          if [ "$PKG" != "$JSR" ]; then
+            echo "::error::version mismatch — package.json=$PKG jsr.json=$JSR. Bump both before releasing."
+            exit 1
+          fi
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # OIDC auth (id-token: write above) — no token. Publishes the .ts
+      # source per jsr.json#exports; re-runs the slow-types check first.
+      - run: npx jsr publish
