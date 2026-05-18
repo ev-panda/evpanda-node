@@ -26,9 +26,6 @@ export default tseslint.config(
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
       ],
       // Passive capture touches untyped peer payloads (express/ws); warn
-    }
-  }
-);
       // rather than block so intentional `any` at boundaries is visible.
       '@typescript-eslint/no-explicit-any': 'warn',
       '@typescript-eslint/consistent-type-imports': 'error',

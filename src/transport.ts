@@ -86,7 +86,6 @@ type CompressFn = (input: Uint8Array) => Promise<Uint8Array>;
 
 /** Lazily + once load the optional zstd peer; null ⇒ caller uses gzip. */
 let zstdLoader: Promise<CompressFn | null> | undefined;
-let zstdLoader: Promise<CompressFn | null> | undefined;
 
 export function getZstd(): Promise<CompressFn | null> {
   return (zstdLoader ??= (async () => {

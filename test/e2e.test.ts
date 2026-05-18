@@ -60,21 +60,17 @@ const startMockUpstream = (): Promise<MockUpstream> => {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-(function() {
-  async function waitFor(
-    predicate: () => boolean,
-    timeoutMs = 3000,
-    intervalMs = 20,
-  ): Promise<void> {
-    const start = Date.now();
-    while (!predicate()) {
-      if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
-      await new Promise((r) => setTimeout(r, intervalMs));
-    }
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 3000,
+  intervalMs = 20,
+): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
-
-  window.waitFor = waitFor;
-})();
+}
 
 /** Valid OCPI message tagged with an index; carries a denylisted header. */
 const makeOCPI = (i: number): OCPIMessage => {

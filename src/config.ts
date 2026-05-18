@@ -81,10 +81,10 @@ export const resolveEndpoint = (raw: unknown): string => {
   try {
     url = new URL(s);
   } catch {
-    throw new Error(`${ERR}: `endpoint` must be a valid URL`);
+    throw new Error(`${ERR}: 'endpoint' must be a valid URL`);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${ERR}: `endpoint` must use http or https`);
+    throw new Error(`${ERR}: 'endpoint' must use http or https`);
   }
   return s.replace(/\/+$/, ""); // transport appends /v1/{protocol}
 }
