@@ -1,0 +1,8 @@
+version = 1
+
+[[analyzers]]
+name = "typescript"
+
+  [analyzers.meta]
+  environment = ["nodejs"]
+  module_system = "es-modules"
