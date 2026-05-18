@@ -2,6 +2,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { gunzipSync } from "node:zlib";
 
+import { decompress as zstdDecompress } from "@mongodb-js/zstd";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 // E2E against the built artifact — exactly what ships.
@@ -32,18 +33,30 @@ const startMockUpstream = (): Promise<MockUpstream> => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
+      void (async () => {
       let buf = Buffer.concat(chunks);
-      if (req.headers["content-encoding"] === "gzip") buf = gunzipSync(buf);
+      const enc = req.headers["content-encoding"];
+      if (enc === "gzip") buf = gunzipSync(buf);
+      else if (enc === "zstd") buf = await zstdDecompress(buf);
       let records: Record<string, unknown>[] = [];
       try {
         const parsed: unknown = JSON.parse(buf.toString("utf8"));
-        if (Array.isArray(parsed)) records = parsed;
+        // New wire contract: { "messages": [ <record>, ... ] }.
+        if (
+          parsed !== null &&
+          typeof parsed === "object" &&
+          Array.isArray((parsed as { messages?: unknown }).messages)
+        ) {
+          records = (parsed as { messages: Record<string, unknown>[] })
+            .messages;
+        }
       } catch {
         /* leave empty */
       }
       received.push({ path: req.url ?? "", headers: req.headers, records });
       res.writeHead(mock.status, { "content-type": "application/json" });
       res.end(JSON.stringify({ captured: records.length, failed: 0 }));
+      })();
     });
   });
 
@@ -89,7 +102,6 @@ const makeOCPI = (i: number): OCPIMessage => {
       requestHeaders: { Authorization: "Bearer SECRET", "X-Trace": String(i) },
       responseHeaders: { "content-type": "application/json" },
       requestBody: new TextEncoder().encode(`body-${i}`),
-      truncated: false,
     },
   };
 };
@@ -119,6 +131,7 @@ describe("EVPanda e2e", () => {
     sdk = EVPanda.start({
       endpoint: mock.url,
       apiKey: "test-key",
+      networkType: "ocpi",
       flushInterval: 100,
     });
 
@@ -127,9 +140,7 @@ describe("EVPanda e2e", () => {
     await waitFor(() => ocpiRecords(mock).length === 3);
 
     const recs = ocpiRecords(mock).sort((a, b) =>
-      String((a.http as { url: string }).url).localeCompare(
-        String((b.http as { url: string }).url),
-      ),
+      String(a.url).localeCompare(String(b.url)),
     );
     expect(recs).toHaveLength(3);
 
@@ -138,31 +149,37 @@ describe("EVPanda e2e", () => {
     expect(mock.received[0]?.headers["x-api-key"]).toBe("test-key");
 
     recs.forEach((rec, i) => {
-      // SDK-stamped envelope fields
-      expect(rec.protocol).toBe("ocpi");
+      // No wire `protocol` field anymore.
+      expect(rec.protocol).toBeUndefined();
+
+      // Flat snake_case ingestion record.
       expect(
         /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
-          String(rec.capturedAt),
+          String(rec.captured_at),
         ),
       ).toBe(true);
+      expect(rec.platform_id).toBe("acme");
+      expect(rec.platform_name).toBe("Acme Mobility");
+      expect(rec.tenant_id).toBe("t1");
+      expect(rec.tenant_name).toBe("Tenant One");
+      expect(rec.direction).toBe("inbound");
+      expect(rec.http_method).toBe("POST");
+      expect(rec.url).toBe(`/ocpi/2.2/cdrs/${i}`);
+      // response_status_code always present.
+      expect(rec.response_status_code).toBe(200);
 
-      const httpRec = rec.http as {
-        url: string;
-        requestHeaders: Record<string, string>;
-        requestBody: string;
-      };
-      expect(httpRec.url).toBe(`/ocpi/2.2/cdrs/${i}`);
+      // request_headers is a JSON object.
+      const reqHeaders = rec.request_headers as Record<string, string>;
+      expect(typeof reqHeaders).toBe("object");
 
       // Redaction: Authorization stripped (case-insensitive), others kept.
-      const keys = Object.keys(httpRec.requestHeaders).map((k) =>
-        k.toLowerCase(),
-      );
+      const keys = Object.keys(reqHeaders).map((k) => k.toLowerCase());
       expect(keys).not.toContain("authorization");
-      expect(httpRec.requestHeaders["X-Trace"]).toBe(String(i));
+      expect(reqHeaders["X-Trace"]).toBe(String(i));
 
       // Binary body round-trips as base64.
       expect(
-        Buffer.from(httpRec.requestBody, "base64").toString("utf8"),
+        Buffer.from(String(rec.request_body), "base64").toString("utf8"),
       ).toBe(`body-${i}`);
     });
   });
@@ -171,6 +188,8 @@ describe("EVPanda e2e", () => {
     sdk = EVPanda.start({
       endpoint: mock.url,
       apiKey: "k",
+      networkType: "ocpi",
+      compression: "gzip",
       flushInterval: 100,
       bufferCapacity: 100_000,
     });
@@ -192,7 +211,7 @@ describe("EVPanda e2e", () => {
 
     // FIFO order preserved across the chunked POSTs.
     ocpiRecords(mock).forEach((rec, i) => {
-      expect((rec.http as { url: string }).url).toBe(`/ocpi/2.2/cdrs/${i}`);
+      expect(rec.url).toBe(`/ocpi/2.2/cdrs/${i}`);
     });
   }, 15000);
 
@@ -200,6 +219,7 @@ describe("EVPanda e2e", () => {
     sdk = EVPanda.start({
       endpoint: mock.url,
       apiKey: "k",
+      networkType: "ocpi",
       bufferCapacity: 5,
       flushInterval: 60_000, // no auto flush during the test
     });
@@ -209,7 +229,7 @@ describe("EVPanda e2e", () => {
 
     await waitFor(() => ocpiRecords(mock).length === 5);
     const urls = ocpiRecords(mock)
-      .map((r) => (r.http as { url: string }).url)
+      .map((r) => String(r.url))
       .sort();
     // Only the newest 5 survive (7..11); the oldest 7 were dropped.
     expect(urls).toEqual([
@@ -225,6 +245,7 @@ describe("EVPanda e2e", () => {
     sdk = EVPanda.start({
       endpoint: mock.url,
       apiKey: "k",
+      networkType: "ocpi",
       flushInterval: 60_000, // never auto-flushes within the test
     });
 
@@ -242,6 +263,7 @@ describe("EVPanda e2e", () => {
     sdk = EVPanda.start({
       endpoint: mock.url,
       apiKey: "k",
+      networkType: "ocpi",
       flushInterval: 60_000,
     });
 

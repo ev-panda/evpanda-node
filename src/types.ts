@@ -26,7 +26,6 @@ export interface CapturedHttp {
   /** Truncated to config.maxCaptureBytes before buffering. */
   requestBody?: Uint8Array;
   responseBody?: Uint8Array;
-  truncated: boolean;
 }
 
 export interface OCPIMessage {
@@ -40,8 +39,9 @@ export interface OCPPMessage {
   identity: ChargerIdentity;
   /** SDK-owned UUID, stable per connection, regenerated on reconnect. */
   connectionId: string;
+  /** Optional for OCPP. */
+  direction?: Direction;
   payload?: Uint8Array;
-  truncated: boolean;
 }
 
 export type AnyMessage = OCPIMessage | OCPPMessage;

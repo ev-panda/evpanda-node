@@ -1,16 +1,18 @@
 /**
- * Hand-rolled transport, zero runtime deps (Node 18+ global fetch). Body:
- * JSON; default gzip, optional zstd peer with gzip fallback; tiny payloads
- * sent uncompressed. Owns the bounded retry: 200 or 400/401/413 → done;
- * 5xx/network → backoff; the caller never retries. Never throws.
+ * Hand-rolled transport over Node 18+ global fetch. Body: JSON; zstd by
+ * default, gzip when configured, identity for tiny payloads. Owns the
+ * bounded retry: 200 or 400/401/413 → done; 5xx/network → backoff; the
+ * caller never retries. Never throws.
  */
 
 import { gzip } from "node:zlib";
 import { promisify } from "node:util";
 
+import { compress as zstdCompress } from "@mongodb-js/zstd";
+
 import type { BufferedMessage } from "./buffer.js";
-import type { ResolvedConfig } from "./config.js";
-import type { Protocol } from "./types.js";
+import type { Logger, ResolvedConfig } from "./config.js";
+import type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";
 
 const gzipAsync = promisify(gzip);
 
@@ -82,46 +84,119 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type CompressFn = (input: Uint8Array) => Promise<Uint8Array>;
+// ── Ingestion wire records ───────────────────────────────────────────────
+//
+// ocpiIngest / ocppIngest are the exact request payload shapes the ingestion
+// service accepts. Keep them in lock-step with that service (and the Go SDK).
 
-/** Lazily + once load the optional zstd peer; null ⇒ caller uses gzip. */
-let zstdLoader: Promise<CompressFn | null> | undefined;
-
-export function getZstd(): Promise<CompressFn | null> {
-  return (zstdLoader ??= (async () => {
-    try {
-      // Non-literal specifier: optional dep, not resolved at build/typecheck.
-      const spec = "@mongodb-js/zstd";
-      const mod = (await import(spec)) as {
-        compress?: (buf: Buffer, level?: number) => Promise<Buffer>;
-      };
-      if (typeof mod.compress !== "function") return null;
-      const compress = mod.compress;
-      return (input: Uint8Array) => compress(Buffer.from(input));
-    } catch {
-      return null;
-    }
-  })());
+interface OcpiIngest {
+  captured_at: string;
+  platform_id: string;
+  platform_name: string;
+  tenant_id?: string;
+  tenant_name?: string;
+  direction: string;
+  http_method: string;
+  url: string;
+  response_status_code: number;
+  request_headers?: Record<string, string>;
+  request_body?: string;
+  response_headers?: Record<string, string>;
+  response_body?: string;
 }
+
+interface OcppIngest {
+  charger_id: string;
+  connection_id: string;
+  tenant_id: string;
+  tenant_name: string;
+  captured_at: string;
+  event_type: number;
+  direction?: string;
+  raw_frame?: string;
+}
+
+interface IngestBody {
+  messages: (OcpiIngest | OcppIngest)[];
+}
+
+/** Header map for the wire, or undefined to omit when empty. */
+function headersJSON(
+  h: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (h === undefined) return undefined;
+  return Object.keys(h).length === 0 ? undefined : h;
+}
+
+/** base64-encode a body/frame, or undefined to omit when empty. */
+function bodyB64(b: Uint8Array | undefined): string | undefined {
+  if (b === undefined || b.byteLength === 0) return undefined;
+  return Buffer.from(b).toString("base64");
+}
+
+/** Non-empty string, or undefined to omit. */
+function optStr(s: string | undefined): string | undefined {
+  return s === undefined || s === "" ? undefined : s;
+}
+
+function isOCPI(m: OCPIMessage | OCPPMessage): m is OCPIMessage {
+  return "http" in m;
+}
+
+function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
+  return {
+    captured_at: e.capturedAt,
+    platform_id: m.identity.platformId,
+    platform_name: m.identity.platformName,
+    tenant_id: optStr(m.identity.tenantId),
+    tenant_name: optStr(m.identity.tenantName),
+    direction: m.direction,
+    http_method: m.http.method,
+    url: m.http.url,
+    response_status_code: m.http.statusCode ?? 0,
+    request_headers: headersJSON(m.http.requestHeaders),
+    request_body: bodyB64(m.http.requestBody),
+    response_headers: headersJSON(m.http.responseHeaders),
+    response_body: bodyB64(m.http.responseBody),
+  };
+}
+
+function ocppRecord(e: BufferedMessage, m: OCPPMessage): OcppIngest {
+  return {
+    charger_id: m.identity.chargerId,
+    connection_id: m.connectionId,
+    tenant_id: m.identity.tenantId ?? "",
+    tenant_name: m.identity.tenantName ?? "",
+    captured_at: e.capturedAt,
+    event_type: m.eventType,
+    direction: optStr(m.direction),
+    raw_frame: bodyB64(m.payload),
+  };
+}
+
 /**
- * Envelope[] → JSON body (message + protocol + capturedAt; Uint8Array →
- * base64). Wire shape must match apispec/ingestion-api.yaml (fixture pack).
+ * Envelope[] → JSON request body `{"messages":[<record>,...]}`. Each
+ * message is mapped to the flat snake_case ingestion record by kind; bodies
+ * are base64 of the Uint8Array. Wire shape must match the ingestion service.
  */
 export function serialize(batch: BufferedMessage[]): Uint8Array {
-  const records = batch.map((e) => ({
-    ...e.message,
-    protocol: e.protocol,
-    capturedAt: e.capturedAt,
-  }));
-  const json = JSON.stringify(records, (_k, v: unknown) =>
-    v instanceof Uint8Array ? Buffer.from(v).toString("base64") : v,
+  const messages: (OcpiIngest | OcppIngest)[] = batch.map((e) =>
+    isOCPI(e.message)
+      ? ocpiRecord(e, e.message)
+      : ocppRecord(e, e.message),
   );
+  const body: IngestBody = { messages };
+  // JSON.stringify omits keys whose value is `undefined`, matching Go's
+  // `omitempty` for the optional fields.
+  const json = JSON.stringify(body);
   return new TextEncoder().encode(json);
 }
 
 export class Transport {
   private readonly _client: ApiClient;
   private readonly _compression: "gzip" | "zstd";
+  /** Records dropped batches; undefined means silent. */
+  private readonly _logger: Logger | undefined;
 
   constructor(config: ResolvedConfig) {
     this._client = new ApiClient({
@@ -129,45 +204,56 @@ export class Transport {
       apiKey: config.apiKey,
     });
     this._compression = config.compression;
+    this._logger = config.logger;
   }
 
-  /** Degrades zstd → gzip → identity on any miss/failure. Never throws. */
+  /** Records a dropped batch when the debug logger is configured. */
+  private _logDrop(protocol: Protocol, n: number, reason: string): void {
+    this._logger?.warn("@evpanda/sdk: dropped batch (delivery failed)", {
+      protocol,
+      messages: n,
+      reason,
+    });
+  }
+
+  /**
+   * Encodes with the configured codec (zstd by default, gzip when
+   * configured), degrading to identity for tiny payloads or on any
+   * failure. Never throws.
+   */
   private async compress(
     raw: Uint8Array,
   ): Promise<{ body: Uint8Array; encoding: ContentEncoding }> {
     if (raw.byteLength < COMPRESS_MIN_BYTES) {
       return { body: raw, encoding: "identity" };
     }
-    const compressors: Record<string, (r: Uint8Array) => Promise<Uint8Array>> = {
-      zstd: async r => {
-        const z = await getZstd();
-        if (!z) throw new Error("No zstd");
-        return z(r);
-      },
-      gzip: gzipAsync
-    };
-    const order = this._compression === "zstd" ? ["zstd", "gzip"] : ["gzip"];
-    for (const enc of order) {
-      const fn = compressors[enc];
-      if (!fn) continue;
-      try {
-        const body = await fn(raw);
-        return { body, encoding: enc as ContentEncoding };
-      } catch {
-        continue;
+    try {
+      if (this._compression === "zstd") {
+        return { body: await zstdCompress(Buffer.from(raw)), encoding: "zstd" };
       }
+      return { body: await gzipAsync(raw), encoding: "gzip" };
+    } catch {
+      return { body: raw, encoding: "identity" };
     }
-    return { body: raw, encoding: "identity" };
   }
 
-  /** Serialize → compress → POST with internal bounded retry. Never throws. */
+  /**
+   * Serialize → compress → POST with internal bounded retry. 200 is
+   * success; 400/401/413 is a permanent drop; 5xx/network errors back off
+   * and retry; a batch that can't be delivered is dropped. Never throws.
+   */
   async send(protocol: Protocol, batch: BufferedMessage[]): Promise<void> {
     if (batch.length === 0) return;
 
-    const { body, encoding } = await this.compress(serialize(batch));
+    let body: Uint8Array;
+    let encoding: ContentEncoding;
+    try {
+      ({ body, encoding } = await this.compress(serialize(batch)));
+    } catch {
+      return; // unserializable batch is dropped
+    }
 
-    const permanentStatuses = new Set([200, 400, 401, 413]);
-
+    let lastStatus = 0;
     for (let attempt = 0; attempt < BACKOFF_MAX_ATTEMPTS; attempt++) {
       if (attempt > 0) {
         const d = nextDelay(attempt);
@@ -179,15 +265,38 @@ export class Transport {
       try {
         status = await this._client.post(protocol, body, encoding);
       } catch {
+        lastStatus = 0;
         continue; // network error / timeout → retryable
       }
+      lastStatus = status;
 
       // 200 accepted; 400/401/413 permanent (drop, never retry — only these
       // three per the ingestion contract); any other non-2xx → retryable.
-      if (permanentStatuses.has(status)) {
+      if (status === 200) {
+        return;
+      }
+      if (status === 400 || status === 401 || status === 413) {
+        this._logDrop(
+          protocol,
+          batch.length,
+          `permanent rejection: HTTP ${status}`,
+        );
         return;
       }
     }
     // retries exhausted → batch dropped (loss acceptable by design)
+    if (lastStatus !== 0) {
+      this._logDrop(
+        protocol,
+        batch.length,
+        `retries exhausted (last HTTP ${lastStatus})`,
+      );
+    } else {
+      this._logDrop(
+        protocol,
+        batch.length,
+        "retries exhausted (network error / timeout)",
+      );
+    }
   }
 }

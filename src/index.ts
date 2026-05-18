@@ -24,4 +24,4 @@ export type {
 
 export { OCPPEventType } from "./types.js";
 
-export type { OCPIMessage, OCPPMessage } from "./types.js";
+export type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";

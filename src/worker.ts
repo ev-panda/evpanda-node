@@ -5,10 +5,9 @@
  * owns bounded shutdown drain. flushOnce() swallows faults — never throws.
  */
 
-import type { BufferedMessage, RingBuffer } from "./buffer.js";
+import type { RingBuffer } from "./buffer.js";
 import type { ResolvedConfig } from "./config.js";
 import type { Transport } from "./transport.js";
-import type { Protocol } from "./types.js";
 
 /** Server batch cap — also the size-based flush trigger. */
 export const BATCH_CAP = 1000;
@@ -104,18 +103,12 @@ export class Worker {
       const batch = this._buffer.drain();
       if (batch.length === 0) return;
 
-      const groups = batch.reduce<Map<Protocol, BufferedMessage[]>>((map, env) => {
-        const msgs = map.get(env.protocol) ?? [];
-        msgs.push(env);
-        map.set(env.protocol, msgs);
-        return map;
-      }, new Map<Protocol, BufferedMessage[]>());
-
-      for (const [protocol, msgs] of groups) {
-        for (let i = 0; i < msgs.length; i += BATCH_CAP) {
-          // Transport owns retry; the worker calls send once and moves on.
-          await this._transport.send(protocol, msgs.slice(i, i + BATCH_CAP));
-        }
+      // A client serves one protocol, so the whole batch goes to one
+      // endpoint, chunked at BATCH_CAP.
+      const protocol = this._config.networkType;
+      for (let i = 0; i < batch.length; i += BATCH_CAP) {
+        // Transport owns retry; the worker calls send once and moves on.
+        await this._transport.send(protocol, batch.slice(i, i + BATCH_CAP));
       }
     } catch {
       // a failed cycle is swallowed — never an unhandledRejection

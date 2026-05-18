@@ -3,11 +3,10 @@
  * drain() copies out and resets; the worker does the POST. Internal.
  */
 
-import type { AnyMessage, Protocol } from "./types.js";
+import type { AnyMessage } from "./types.js";
 
-/** Internal envelope: SDK-stamped `protocol` + `capturedAt` (receive time). */
+/** Internal envelope: SDK-stamped `capturedAt` (receive time) + message. */
 export interface BufferedMessage {
-  protocol: Protocol;
   capturedAt: string;
   message: AnyMessage;
 }

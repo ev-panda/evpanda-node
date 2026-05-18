@@ -71,7 +71,6 @@
     "vitest": "^1.6.0"
   },
   "peerDependencies": {
-    "@mongodb-js/zstd": "*",
     "express": "*",
     "ws": "*"
   },
@@ -85,9 +84,9 @@
     },
     "ws": {
       "optional": true
-    },
-    "@mongodb-js/zstd": {
-      "optional": true
     }
+  },
+  "dependencies": {
+    "@mongodb-js/zstd": "^7.0.0"
   }
 }

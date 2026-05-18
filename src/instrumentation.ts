@@ -16,7 +16,6 @@ export function captureOCPI(buffer: RingBuffer, msg: OCPIMessage): void {
   const capturedAt = new Date().toISOString();
   if (!validateRoamingIdentity(msg.identity)) return; // drop, never throw
   const env: BufferedMessage = {
-    protocol: "ocpi",
     capturedAt,
     message: redact(msg),
   };
@@ -27,7 +26,6 @@ export function captureOCPP(buffer: RingBuffer, msg: OCPPMessage): void {
   const capturedAt = new Date().toISOString();
   if (!validateChargerIdentity(msg.identity)) return; // drop, never throw
   const env: BufferedMessage = {
-    protocol: "ocpp",
     capturedAt,
     message: redact(msg),
   };

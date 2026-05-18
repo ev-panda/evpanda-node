@@ -13,7 +13,7 @@ import { Transport } from "./transport.js";
 import { Worker } from "./worker.js";
 
 import type { EVPandaConfig } from "./config.js";
-import type { OCPIMessage, OCPPMessage } from "./types.js";
+import type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";
 
 export interface SdkImpl {
   captureOCPI(msg: OCPIMessage): void;
@@ -26,6 +26,7 @@ export interface SdkImpl {
 class ActiveSDK implements SdkImpl {
   readonly #worker: Worker;
   readonly #buffer: RingBuffer;
+  readonly #networkType: Protocol;
 
   /** Pure build, no side effects. resolveConfig() is the only throw site. */
   constructor(config: EVPandaConfig) {
@@ -33,6 +34,7 @@ class ActiveSDK implements SdkImpl {
     const buffer = new RingBuffer(resolved.bufferCapacity);
     this.#worker = new Worker(buffer, new Transport(resolved), resolved);
     this.#buffer = buffer;
+    this.#networkType = resolved.networkType;
   }
 
   /** Arm the worker. Called last by EVPanda.start(). */
@@ -40,11 +42,15 @@ class ActiveSDK implements SdkImpl {
     this.#worker.start();
   }
 
+  /** No-op unless this client serves the OCPI protocol. */
   captureOCPI(msg: OCPIMessage): void {
+    if (this.#networkType !== "ocpi") return;
     captureOCPIImpl(this.#buffer, msg);
   }
 
+  /** No-op unless this client serves the OCPP protocol. */
   captureOCPP(msg: OCPPMessage): void {
+    if (this.#networkType !== "ocpp") return;
     captureOCPPImpl(this.#buffer, msg);
   }
 
