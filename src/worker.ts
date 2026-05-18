@@ -104,12 +104,12 @@ export class Worker {
       const batch = this._buffer.drain();
       if (batch.length === 0) return;
 
-      const groups = new Map<Protocol, BufferedMessage[]>();
-      for (const env of batch) {
-        const g = groups.get(env.protocol);
-        if (g) g.push(env);
-        else groups.set(env.protocol, [env]);
-      }
+      const groups = batch.reduce<Map<Protocol, BufferedMessage[]>>((map, env) => {
+        const msgs = map.get(env.protocol) ?? [];
+        msgs.push(env);
+        map.set(env.protocol, msgs);
+        return map;
+      }, new Map<Protocol, BufferedMessage[]>());
 
       for (const [protocol, msgs] of groups) {
         for (let i = 0; i < msgs.length; i += BATCH_CAP) {

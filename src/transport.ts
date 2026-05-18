@@ -138,19 +138,26 @@ export class Transport {
     if (raw.byteLength < COMPRESS_MIN_BYTES) {
       return { body: raw, encoding: "identity" };
     }
-    if (this._compression === "zstd") {
-      try {
+    const compressors: Record<string, (r: Uint8Array) => Promise<Uint8Array>> = {
+      zstd: async r => {
         const z = await getZstd();
-        if (z) return { body: await z(raw), encoding: "zstd" };
+        if (!z) throw new Error("No zstd");
+        return z(r);
+      },
+      gzip: gzipAsync
+    };
+    const order = this._compression === "zstd" ? ["zstd", "gzip"] : ["gzip"];
+    for (const enc of order) {
+      const fn = compressors[enc];
+      if (!fn) continue;
+      try {
+        const body = await fn(raw);
+        return { body, encoding: enc as ContentEncoding };
       } catch {
-        // fall through to gzip
+        continue;
       }
     }
-    try {
-      return { body: await gzipAsync(raw), encoding: "gzip" };
-    } catch {
-      return { body: raw, encoding: "identity" };
-    }
+    return { body: raw, encoding: "identity" };
   }
 
   /** Serialize → compress → POST with internal bounded retry. Never throws. */
@@ -158,6 +165,8 @@ export class Transport {
     if (batch.length === 0) return;
 
     const { body, encoding } = await this.compress(serialize(batch));
+
+    const permanentStatuses = new Set([200, 400, 401, 413]);
 
     for (let attempt = 0; attempt < BACKOFF_MAX_ATTEMPTS; attempt++) {
       if (attempt > 0) {
@@ -175,12 +184,7 @@ export class Transport {
 
       // 200 accepted; 400/401/413 permanent (drop, never retry — only these
       // three per the ingestion contract); any other non-2xx → retryable.
-      if (
-        status === 200 ||
-        status === 400 ||
-        status === 401 ||
-        status === 413
-      ) {
+      if (permanentStatuses.has(status)) {
         return;
       }
     }
