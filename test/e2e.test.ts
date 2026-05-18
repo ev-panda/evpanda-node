@@ -24,7 +24,7 @@ interface MockUpstream {
   close(): Promise<void>;
 }
 
-function startMockUpstream(): Promise<MockUpstream> {
+const startMockUpstream = (): Promise<MockUpstream> => {
   const received: Received[] = [];
   const mock = { received, status: 200 } as MockUpstream;
 
@@ -56,24 +56,28 @@ function startMockUpstream(): Promise<MockUpstream> {
       resolve(mock);
     });
   });
-}
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-async function waitFor(
-  predicate: () => boolean,
-  timeoutMs = 3000,
-  intervalMs = 20,
-): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
-    await new Promise((r) => setTimeout(r, intervalMs));
+(function() {
+  async function waitFor(
+    predicate: () => boolean,
+    timeoutMs = 3000,
+    intervalMs = 20,
+  ): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
   }
-}
+
+  window.waitFor = waitFor;
+})();
 
 /** Valid OCPI message tagged with an index; carries a denylisted header. */
-function makeOCPI(i: number): OCPIMessage {
+const makeOCPI = (i: number): OCPIMessage => {
   return {
     direction: "inbound",
     identity: {
@@ -92,7 +96,7 @@ function makeOCPI(i: number): OCPIMessage {
       truncated: false,
     },
   };
-}
+};
 
 const ocpiRecords = (m: MockUpstream) =>
   m.received
