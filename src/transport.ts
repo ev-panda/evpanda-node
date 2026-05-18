@@ -89,54 +89,63 @@ export function sleep(ms: number): Promise<void> {
 // ocpiIngest / ocppIngest are the exact request payload shapes the ingestion
 // service accepts. Keep them in lock-step with that service (and the Go SDK).
 
+// Optional fields are `T | null` (present, value null) — an absent value
+// serializes as JSON null, never a zero value or an omitted key, matching
+// the Go SDK's non-omitempty pointer fields.
+
 interface OcpiIngest {
   captured_at: string;
   platform_id: string;
   platform_name: string;
-  tenant_id?: string;
-  tenant_name?: string;
+  tenant_id: string | null;
+  tenant_name: string | null;
   direction: string;
   http_method: string;
   url: string;
-  response_status_code: number;
-  request_headers?: Record<string, string>;
-  request_body?: string;
-  response_headers?: Record<string, string>;
-  response_body?: string;
+  response_status_code: number | null;
+  request_headers: Record<string, string> | null;
+  request_body: string | null;
+  response_headers: Record<string, string> | null;
+  response_body: string | null;
 }
 
 interface OcppIngest {
   charger_id: string;
   connection_id: string;
-  tenant_id: string;
-  tenant_name: string;
+  tenant_id: string | null;
+  tenant_name: string | null;
   captured_at: string;
   event_type: number;
-  direction?: string;
-  raw_frame?: string;
+  direction: string | null;
+  raw_frame: string | null;
 }
 
 interface IngestBody {
   messages: (OcpiIngest | OcppIngest)[];
 }
 
-/** Header map for the wire, or undefined to omit when empty. */
+/** Header map for the wire, or null when empty. */
 function headersJSON(
   h: Record<string, string> | undefined,
-): Record<string, string> | undefined {
-  if (h === undefined) return undefined;
-  return Object.keys(h).length === 0 ? undefined : h;
+): Record<string, string> | null {
+  if (h === undefined || Object.keys(h).length === 0) return null;
+  return h;
 }
 
-/** base64-encode a body/frame, or undefined to omit when empty. */
-function bodyB64(b: Uint8Array | undefined): string | undefined {
-  if (b === undefined || b.byteLength === 0) return undefined;
+/** base64-encode a body/frame, or null when empty. */
+function bodyB64(b: Uint8Array | undefined): string | null {
+  if (b === undefined || b.byteLength === 0) return null;
   return Buffer.from(b).toString("base64");
 }
 
-/** Non-empty string, or undefined to omit. */
-function optStr(s: string | undefined): string | undefined {
-  return s === undefined || s === "" ? undefined : s;
+/** Non-empty string, or null. */
+function optStr(s: string | undefined): string | null {
+  return s === undefined || s === "" ? null : s;
+}
+
+/** Non-zero number, or null (0 is treated as absent, matching Go). */
+function optInt(n: number | undefined): number | null {
+  return n === undefined || n === 0 ? null : n;
 }
 
 function isOCPI(m: OCPIMessage | OCPPMessage): m is OCPIMessage {
@@ -153,7 +162,7 @@ function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
     direction: m.direction,
     http_method: m.http.method,
     url: m.http.url,
-    response_status_code: m.http.statusCode ?? 0,
+    response_status_code: optInt(m.http.statusCode),
     request_headers: headersJSON(m.http.requestHeaders),
     request_body: bodyB64(m.http.requestBody),
     response_headers: headersJSON(m.http.responseHeaders),
@@ -165,8 +174,8 @@ function ocppRecord(e: BufferedMessage, m: OCPPMessage): OcppIngest {
   return {
     charger_id: m.identity.chargerId,
     connection_id: m.connectionId,
-    tenant_id: m.identity.tenantId ?? "",
-    tenant_name: m.identity.tenantName ?? "",
+    tenant_id: optStr(m.identity.tenantId),
+    tenant_name: optStr(m.identity.tenantName),
     captured_at: e.capturedAt,
     event_type: m.eventType,
     direction: optStr(m.direction),
@@ -186,8 +195,8 @@ export function serialize(batch: BufferedMessage[]): Uint8Array {
       : ocppRecord(e, e.message),
   );
   const body: IngestBody = { messages };
-  // JSON.stringify omits keys whose value is `undefined`, matching Go's
-  // `omitempty` for the optional fields.
+  // Optional fields are explicit null (never undefined), so every key is
+  // present — matching the Go SDK's non-omitempty pointer fields.
   const json = JSON.stringify(body);
   return new TextEncoder().encode(json);
 }
