@@ -24,7 +24,7 @@ const BACKOFF_MAX_ATTEMPTS = 5;
  * Delay (ms) before attempt n (0-indexed). null ⇒ attempts exhausted.
  * Capped exponential with full jitter.
  */
-function nextDelay(attempt: number): number | null {
+export function nextDelay(attempt: number): number | null {
   if (attempt >= BACKOFF_MAX_ATTEMPTS) return null;
   const capped = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** attempt);
   return Math.floor(Math.random() * capped);
@@ -78,7 +78,7 @@ export type ContentEncoding = "identity" | "gzip" | "zstd";
 /** Below this raw size, compression isn't worth the CPU; send identity. */
 const COMPRESS_MIN_BYTES = 1024;
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -86,7 +86,7 @@ type CompressFn = (input: Uint8Array) => Promise<Uint8Array>;
 
 /** Lazily + once load the optional zstd peer; null ⇒ caller uses gzip. */
 let zstdLoader: Promise<CompressFn | null> | undefined;
-function getZstd(): Promise<CompressFn | null> {
+export function getZstd(): Promise<CompressFn | null> {
   return (zstdLoader ??= (async () => {
     try {
       // Non-literal specifier: optional dep, not resolved at build/typecheck.
@@ -107,7 +107,7 @@ function getZstd(): Promise<CompressFn | null> {
  * Envelope[] → JSON body (message + protocol + capturedAt; Uint8Array →
  * base64). Wire shape must match apispec/ingestion-api.yaml (fixture pack).
  */
-function serialize(batch: BufferedMessage[]): Uint8Array {
+export function serialize(batch: BufferedMessage[]): Uint8Array {
   const records = batch.map((e) => ({
     ...e.message,
     protocol: e.protocol,

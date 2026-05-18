@@ -52,7 +52,7 @@ export const DEFAULTS = {
 
 const ERR = "@evpanda/sdk config";
 
-function requireNonEmptyString(value: unknown, field: string): string {
+export function requireNonEmptyString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error(
       `${ERR}: \`${field}\` is required and must be a non-empty string`,
@@ -62,7 +62,7 @@ function requireNonEmptyString(value: unknown, field: string): string {
 }
 
 /** undefined ⇒ fallback; otherwise must be an integer ≥ min. */
-function resolveInt(
+export function resolveInt(
   value: number | undefined,
   fallback: number,
   field: string,
@@ -75,22 +75,22 @@ function resolveInt(
   return value;
 }
 
-function resolveEndpoint(raw: unknown): string {
+export function resolveEndpoint(raw: unknown): string {
   const s = requireNonEmptyString(raw, "endpoint");
   let url: URL;
   try {
     url = new URL(s);
   } catch {
-    throw new Error(`${ERR}: \`endpoint\` must be a valid URL`);
+    throw new Error(`${ERR}: `endpoint` must be a valid URL`);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${ERR}: \`endpoint\` must use http or https`);
+    throw new Error(`${ERR}: `endpoint` must use http or https`);
   }
   return s.replace(/\/+$/, ""); // transport appends /v1/{protocol}
 }
 
 /** undefined ⇒ "gzip"; otherwise must be exactly "gzip" or "zstd". */
-function resolveCompression(value: unknown): "gzip" | "zstd" {
+export function resolveCompression(value: unknown): "gzip" | "zstd" {
   if (value === undefined) return DEFAULTS.compression;
   if (value === "gzip" || value === "zstd") return value;
   throw new Error(`${ERR}: \`compression\` must be "gzip" or "zstd"`);

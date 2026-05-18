@@ -34,12 +34,12 @@ export type IdentityInput<Ctx, I extends AnyIdentity> =
 // ── Validators — the single rule source, shared by both paths ────────────
 
 /** A usable string value: present, a string, not blank. */
-function isNonEmpty(v: unknown): v is string {
+export function isNonEmpty(v: unknown): v is string {
   return typeof v === "string" && v.trim() !== "";
 }
 
 /** Tenant is all-or-nothing: both tenantId & tenantName, or neither. */
-function isTenantPairValid(id: {
+export function isTenantPairValid(id: {
   tenantId?: string;
   tenantName?: string;
 }): boolean {
@@ -70,7 +70,7 @@ export function validateChargerIdentity(id: ChargerIdentity): boolean {
 // ── Adapter-path resolution (delegates to the validators above) ──────────
 
 /** Input → raw identity, or null (resolver throw/nullish ⇒ null). */
-function resolveInput<Ctx, I extends AnyIdentity>(
+export function resolveInput<Ctx, I extends AnyIdentity>(
   input: IdentityInput<Ctx, I> | undefined,
   ctx: Ctx,
 ): I | null {

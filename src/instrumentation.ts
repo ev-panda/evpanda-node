@@ -46,7 +46,7 @@ export const DEFAULT_HEADER_DENYLIST = [
 const DENY = new Set<string>(DEFAULT_HEADER_DENYLIST);
 
 /** Copy headers minus the denylisted ones (case-insensitive). */
-function stripHeaders(h: Record<string, string>): Record<string, string> {
+export function stripHeaders(h: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(h)) {
     if (!DENY.has(k.toLowerCase())) out[k] = v;
