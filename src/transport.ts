@@ -140,8 +140,8 @@ export class Transport {
     }
     if (this._compression === "zstd") {
       try {
-        const z = await getZstd();
-        if (z) return { body: await z(raw), encoding: "zstd" };
+        const zstdCompressor = await getZstd();
+        if (zstdCompressor) return { body: await zstdCompressor(raw), encoding: "zstd" };
       } catch {
         // fall through to gzip
       }
@@ -161,9 +161,9 @@ export class Transport {
 
     for (let attempt = 0; attempt < BACKOFF_MAX_ATTEMPTS; attempt++) {
       if (attempt > 0) {
-        const d = nextDelay(attempt);
-        if (d === null) break;
-        await sleep(d);
+        const delay = nextDelay(attempt);
+        if (delay === null) break;
+        await sleep(delay);
       }
 
       let status: number;

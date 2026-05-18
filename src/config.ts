@@ -76,17 +76,17 @@ function resolveInt(
 }
 
 function resolveEndpoint(raw: unknown): string {
-  const s = requireNonEmptyString(raw, "endpoint");
+  const endpointString = requireNonEmptyString(raw, "endpoint");
   let url: URL;
   try {
-    url = new URL(s);
+    url = new URL(endpointString);
   } catch {
-    throw new Error(`${ERR}: \`endpoint\` must be a valid URL`);
+    throw new Error(`${ERR}: `endpoint` must be a valid URL`);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${ERR}: \`endpoint\` must use http or https`);
+    throw new Error(`${ERR}: `endpoint` must use http or https`);
   }
-  return s.replace(/\/+$/, ""); // transport appends /v1/{protocol}
+  return endpointString.replace(/\/+$/, ""); // transport appends /v1/{protocol}
 }
 
 /** undefined ⇒ "gzip"; otherwise must be exactly "gzip" or "zstd". */

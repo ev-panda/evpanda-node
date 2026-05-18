@@ -39,11 +39,11 @@ export class Worker {
   /** Single-flight: a concurrent call joins the in-flight flush. */
   flushOnce(): Promise<void> {
     if (this._inflight) return this._inflight;
-    const p = this._runFlush().finally(() => {
-      if (this._inflight === p) this._inflight = null;
+    const flushPromise = this._runFlush().finally(() => {
+      if (this._inflight === flushPromise) this._inflight = null;
     });
-    this._inflight = p;
-    return p;
+    this._inflight = flushPromise;
+    return flushPromise;
   }
 
   /** Stop the timer only. No drain — close() owns the final drain. */
@@ -106,8 +106,8 @@ export class Worker {
 
       const groups = new Map<Protocol, BufferedMessage[]>();
       for (const env of batch) {
-        const g = groups.get(env.protocol);
-        if (g) g.push(env);
+        const group = groups.get(env.protocol);
+        if (group) group.push(env);
         else groups.set(env.protocol, [env]);
       }
 
