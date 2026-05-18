@@ -75,7 +75,7 @@ export function resolveInt(
   return value;
 }
 
-export function resolveEndpoint(raw: unknown): string {
+export const resolveEndpoint = (raw: unknown): string => {
   const s = requireNonEmptyString(raw, "endpoint");
   let url: URL;
   try {
