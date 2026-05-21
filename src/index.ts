@@ -1,27 +1,30 @@
-/** @evpanda/sdk — public entrypoint. Capture via the EVPanda methods. */
+/** @evpanda/sdk — public entrypoint. */
 
-export { EVPanda } from "./sdk.js";
+export { OCPIClient } from "./ocpi/client.js";
+export { OCPPClient } from "./ocpp/client.js";
 
-// Optional adapters (express/ws are optional peer deps, loaded only if used).
-export { ocpiInbound } from "./adapters/express.js";
-export { wrapFetch } from "./adapters/fetch.js";
-export { recordConnection } from "./adapters/ws.js";
+// OCPI adapters — `ocpi.express`, `ocpi.fetch`, `ocpi.axios`. Each takes an
+// `OCPIClient` and shares the `OCPIResolver` contract.
+export * as ocpi from "./ocpi/adapters/index.js";
 
-export type { ExpressMiddlewareOptions } from "./adapters/express.js";
-export type { FetchWrapOptions } from "./adapters/fetch.js";
-export type {
-  OCPPRecorderOptions,
-  ConnectionRecorder,
-} from "./adapters/ws.js";
-
-export type { EVPandaConfig, Logger } from "./config.js";
+export type { OCPIConfig, OCPPConfig, Logger } from "./config.js";
 
 export type {
   RoamingIdentity,
   ChargerIdentity,
-  IdentityInput,
+  OCPIResolver,
+  OCPIResolverCtx,
 } from "./identity.js";
+
+export type { OCPPMessageInput, OCPPSession } from "./ocpp/client.js";
 
 export { OCPPEventType } from "./types.js";
 
-export type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";
+export type {
+  OCPIDirection,
+  OCPIMessage,
+  OCPIMessageInput,
+  OCPPDirection,
+  OCPPMessage,
+  Protocol,
+} from "./types.js";

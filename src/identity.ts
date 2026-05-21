@@ -1,8 +1,9 @@
 /**
- * Per-message identity: shapes, input forms, validation/resolution. Two
- * independent shapes (no shared base). validate* is the single rule; both
- * the adapter path (via resolve*) and the primitive path go through it.
- * Nothing here throws; absent/invalid ⇒ caller drops the message.
+ * Per-message identity: the two protocol shapes, the OCPI resolver
+ * contract, and the validation rules. `validate*` is the single rule
+ * source — every capture path (adapter and primitive) goes through it.
+ * Nothing here throws; an absent/invalid identity ⇒ the caller drops the
+ * message.
  */
 
 /** OCPI roaming context. platform required; tenant all-or-nothing. */
@@ -20,26 +21,32 @@ export interface ChargerIdentity {
   tenantName?: string;
 }
 
-/** Either identity — used where the protocol is not statically known. */
-export type AnyIdentity = RoamingIdentity | ChargerIdentity;
+// ── OCPI resolver contract ───────────────────────────────────────────────
+//
+// OCPI identity is per-request (it's in the partner's headers), so the
+// adapters take a resolver function, not a fixed value. OCPP needs none —
+// charger identity is known at connect time.
 
-/** Pull form: derive the identity from the adapter's framework context. */
-export type IdentityResolver<Ctx, I extends AnyIdentity> = (ctx: Ctx) => I;
+/** HTTP-shaped envelope passed to an OCPI resolver. */
+export interface OCPIResolverCtx {
+  method: string;
+  url: string;
+  /** Normalized to lowercase keys, single-string values. */
+  headers: Record<string, string>;
+}
 
-/** What an adapter accepts: a fixed object or a per-ctx resolver. */
-export type IdentityInput<Ctx, I extends AnyIdentity> =
-  | I
-  | IdentityResolver<Ctx, I>;
+/** Function the OCPI adapters accept: request context → roaming identity. */
+export type OCPIResolver = (ctx: OCPIResolverCtx) => RoamingIdentity;
 
-// ── Validators — the single rule source, shared by both paths ────────────
+// ── Validators — the single rule source ──────────────────────────────────
 
 /** A usable string value: present, a string, not blank. */
-export function isNonEmpty(v: unknown): v is string {
+function isNonEmpty(v: unknown): v is string {
   return typeof v === "string" && v.trim() !== "";
 }
 
 /** Tenant is all-or-nothing: both tenantId & tenantName, or neither. */
-export function isTenantPairValid(id: {
+function isTenantPairValid(id: {
   tenantId?: string;
   tenantName?: string;
 }): boolean {
@@ -65,41 +72,4 @@ export function validateChargerIdentity(id: ChargerIdentity): boolean {
     isNonEmpty(id.chargerId) &&
     isTenantPairValid(id)
   );
-}
-
-// ── Adapter-path resolution (delegates to the validators above) ──────────
-
-/** Input → raw identity, or null (resolver throw/nullish ⇒ null). */
-export function resolveInput<Ctx, I extends AnyIdentity>(
-  input: IdentityInput<Ctx, I> | undefined,
-  ctx: Ctx,
-): I | null {
-  if (input === undefined) return null;
-  if (typeof input === "function") {
-    try {
-      // typeof check narrowed the value|callback union: only the resolver is callable.
-      return input(ctx) ?? null;
-    } catch {
-      return null;
-    }
-  }
-  return input;
-}
-
-/** Resolve + validate an OCPI identity input; null if absent/invalid. */
-export function resolveRoamingIdentity<Ctx>(
-  input: IdentityInput<Ctx, RoamingIdentity> | undefined,
-  ctx: Ctx,
-): RoamingIdentity | null {
-  const id = resolveInput(input, ctx);
-  return id !== null && validateRoamingIdentity(id) ? id : null;
-}
-
-/** Resolve + validate an OCPP identity input; null if absent/invalid. */
-export function resolveChargerIdentity<Ctx>(
-  input: IdentityInput<Ctx, ChargerIdentity> | undefined,
-  ctx: Ctx,
-): ChargerIdentity | null {
-  const id = resolveInput(input, ctx);
-  return id !== null && validateChargerIdentity(id) ? id : null;
 }
