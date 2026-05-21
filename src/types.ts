@@ -8,7 +8,11 @@ import type { ChargerIdentity, RoamingIdentity } from "./identity.js";
 
 export type Protocol = "ocpi" | "ocpp";
 
-export type Direction = "inbound" | "outbound";
+/** Direction of an OCPI message relative to the host. */
+export type OCPIDirection = "IN" | "OUT";
+
+/** Direction of an OCPP frame relative to the charge point. */
+export type OCPPDirection = "TO_CP" | "FROM_CP";
 
 /** OCPP WS lifecycle → ingestion event_type. */
 export enum OCPPEventType {
@@ -23,16 +27,23 @@ export interface CapturedHttp {
   statusCode?: number;
   requestHeaders: Record<string, string>;
   responseHeaders: Record<string, string>;
-  /** Truncated to config.maxCaptureBytes before buffering. */
+  /** Capped at `maxCaptureBytes`; an oversize body drops the whole message. */
   requestBody?: Uint8Array;
   responseBody?: Uint8Array;
 }
 
 export interface OCPIMessage {
-  direction: Direction;
+  direction: OCPIDirection;
   identity: RoamingIdentity;
   http: CapturedHttp;
 }
+
+/**
+ * OCPI message as supplied to `OCPIClient.captureInboundMessage` /
+ * `captureOutboundMessage`. `direction` is omitted — the chosen method
+ * sets it.
+ */
+export type OCPIMessageInput = Omit<OCPIMessage, "direction">;
 
 export interface OCPPMessage {
   eventType: OCPPEventType;
@@ -40,7 +51,7 @@ export interface OCPPMessage {
   /** SDK-owned UUID, stable per connection, regenerated on reconnect. */
   connectionId: string;
   /** Optional for OCPP. */
-  direction?: Direction;
+  direction?: OCPPDirection;
   payload?: Uint8Array;
 }
 

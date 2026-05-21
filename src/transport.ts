@@ -3,18 +3,42 @@
  * default, gzip when configured, identity for tiny payloads. Owns the
  * bounded retry: 200 or 400/401/413 → done; 5xx/network → backoff; the
  * caller never retries. Never throws.
+ *
+ * The actual `POST /v1/{protocol}` lives in `Transport._post` — no
+ * generated client (it would pull heavy transitive deps into customer
+ * production for two endpoints) and no separate wrapper class.
  */
 
 import { gzip } from "node:zlib";
 import { promisify } from "node:util";
-
-import { compress as zstdCompress } from "@mongodb-js/zstd";
 
 import type { BufferedMessage } from "./buffer.js";
 import type { Logger, ResolvedConfig } from "./config.js";
 import type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";
 
 const gzipAsync = promisify(gzip);
+
+// ── zstd — optional ──────────────────────────────────────────────────────
+//
+// `@mongodb-js/zstd` is a native addon and an optional peer dependency,
+// loaded lazily; absent ⇒ gzip fallback. So the SDK has no hard runtime dep.
+
+/** Local shape of zstd's `compress`, so nothing statically imports the package. */
+type ZstdCompress = (data: Buffer) => Promise<Buffer>;
+
+/** undefined = not tried yet · null = unavailable · fn = loaded. */
+let zstdCompress: ZstdCompress | null | undefined;
+
+/** Resolve the zstd compressor once; null when the optional peer is absent. */
+async function loadZstd(): Promise<ZstdCompress | null> {
+  if (zstdCompress !== undefined) return zstdCompress;
+  try {
+    zstdCompress = (await import("@mongodb-js/zstd")).compress;
+  } catch {
+    zstdCompress = null; // optional peer not installed — gzip is used instead
+  }
+  return zstdCompress;
+}
 
 // ── Backoff (module-private, fixed by design — not configurable) ─────────
 
@@ -23,75 +47,31 @@ const BACKOFF_MAX_MS = 30_000;
 const BACKOFF_MAX_ATTEMPTS = 5;
 
 /**
- * Delay (ms) before attempt n (0-indexed). null ⇒ attempts exhausted.
- * Capped exponential with full jitter.
+ * Delay (ms) before a retry attempt. Capped exponential with full jitter.
+ * The retry count is bounded by the `send` loop, not here.
  */
-export function nextDelay(attempt: number): number | null {
-  if (attempt >= BACKOFF_MAX_ATTEMPTS) return null;
+function nextDelay(attempt: number): number {
   const capped = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** attempt);
   return Math.floor(Math.random() * capped);
-}
-
-// ── API client ───────────────────────────────────────────────
-//
-// The inner "client": a 1:1 wrapper over the two ingestion endpoints.
-// TRANSPORT ONLY — no buffering, no retry policy, no telemetry. Hand-rolled
-// over global fetch; no generated client (would pull heavy transitive deps
-// into customer production for two endpoints).
-
-export interface ApiClientOptions {
-  endpoint: string;
-  apiKey: string;
 }
 
 /** Per-attempt request cap so a hung connection still feeds the backoff. */
 const REQUEST_TIMEOUT_MS = 30_000;
 
-export class ApiClient {
-  constructor(private readonly _opts: ApiClientOptions) {}
-
-  /** Single POST /v1/{protocol}; drains the body, returns the status. */
-  async post(
-    protocol: Protocol,
-    body: Uint8Array,
-    encoding: ContentEncoding,
-  ): Promise<number> {
-    const headers: Record<string, string> = {
-      "content-type": "application/json",
-      "x-api-key": this._opts.apiKey,
-    };
-    if (encoding !== "identity") headers["content-encoding"] = encoding;
-
-    const res = await fetch(`${this._opts.endpoint}/v1/${protocol}`, {
-      method: "POST",
-      headers,
-      body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    await res.text(); // drain so the socket can be released; body unused
-    return res.status;
-  }
-}
-
-// ── Transport ────────────────────────────────────────────────
-
-export type ContentEncoding = "identity" | "gzip" | "zstd";
+type ContentEncoding = "identity" | "gzip" | "zstd";
 
 /** Below this raw size, compression isn't worth the CPU; send identity. */
 const COMPRESS_MIN_BYTES = 1024;
 
-export function sleep(ms: number): Promise<void> {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ── Ingestion wire records ───────────────────────────────────────────────
 //
-// ocpiIngest / ocppIngest are the exact request payload shapes the ingestion
-// service accepts. Keep them in lock-step with that service (and the Go SDK).
-
-// Optional fields are `T | null` (present, value null) — an absent value
-// serializes as JSON null, never a zero value or an omitted key, matching
-// the Go SDK's non-omitempty pointer fields.
+// The exact request payload shapes the ingestion service accepts — keep in
+// lock-step with that service and the Go SDK. Optional fields are `T | null`:
+// an absent value serializes as JSON null, never a zero or omitted key.
 
 interface OcpiIngest {
   captured_at: string;
@@ -188,30 +168,26 @@ function ocppRecord(e: BufferedMessage, m: OCPPMessage): OcppIngest {
  * message is mapped to the flat snake_case ingestion record by kind; bodies
  * are base64 of the Uint8Array. Wire shape must match the ingestion service.
  */
-export function serialize(batch: BufferedMessage[]): Uint8Array {
+function serialize(batch: BufferedMessage[]): Uint8Array {
   const messages: (OcpiIngest | OcppIngest)[] = batch.map((e) =>
     isOCPI(e.message)
       ? ocpiRecord(e, e.message)
       : ocppRecord(e, e.message),
   );
   const body: IngestBody = { messages };
-  // Optional fields are explicit null (never undefined), so every key is
-  // present — matching the Go SDK's non-omitempty pointer fields.
-  const json = JSON.stringify(body);
-  return new TextEncoder().encode(json);
+  return new TextEncoder().encode(JSON.stringify(body));
 }
 
 export class Transport {
-  private readonly _client: ApiClient;
+  private readonly _endpoint: string;
+  private readonly _apiKey: string;
   private readonly _compression: "gzip" | "zstd";
   /** Records dropped batches; undefined means silent. */
   private readonly _logger: Logger | undefined;
 
   constructor(config: ResolvedConfig) {
-    this._client = new ApiClient({
-      endpoint: config.endpoint,
-      apiKey: config.apiKey,
-    });
+    this._endpoint = config.endpoint;
+    this._apiKey = config.apiKey;
     this._compression = config.compression;
     this._logger = config.logger;
   }
@@ -225,10 +201,31 @@ export class Transport {
     });
   }
 
+  /** Single POST /v1/{protocol}; drains the body, returns the status. */
+  private async _post(
+    protocol: Protocol,
+    body: Uint8Array,
+    encoding: ContentEncoding,
+  ): Promise<number> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-api-key": this._apiKey,
+    };
+    if (encoding !== "identity") headers["content-encoding"] = encoding;
+
+    const res = await fetch(`${this._endpoint}/v1/${protocol}`, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    await res.text(); // drain so the socket can be released; body unused
+    return res.status;
+  }
+
   /**
-   * Encodes with the configured codec (zstd by default, gzip when
-   * configured), degrading to identity for tiny payloads or on any
-   * failure. Never throws.
+   * Encode with the configured codec — identity for tiny payloads, gzip if
+   * zstd is requested but its optional peer is absent, identity on failure.
    */
   private async compress(
     raw: Uint8Array,
@@ -238,7 +235,11 @@ export class Transport {
     }
     try {
       if (this._compression === "zstd") {
-        return { body: await zstdCompress(Buffer.from(raw)), encoding: "zstd" };
+        const zstd = await loadZstd();
+        if (zstd) {
+          return { body: await zstd(Buffer.from(raw)), encoding: "zstd" };
+        }
+        // zstd requested but the optional peer is absent — fall through to gzip.
       }
       return { body: await gzipAsync(raw), encoding: "gzip" };
     } catch {
@@ -264,15 +265,11 @@ export class Transport {
 
     let lastStatus = 0;
     for (let attempt = 0; attempt < BACKOFF_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 0) {
-        const d = nextDelay(attempt);
-        if (d === null) break;
-        await sleep(d);
-      }
+      if (attempt > 0) await sleep(nextDelay(attempt));
 
       let status: number;
       try {
-        status = await this._client.post(protocol, body, encoding);
+        status = await this._post(protocol, body, encoding);
       } catch {
         lastStatus = 0;
         continue; // network error / timeout → retryable

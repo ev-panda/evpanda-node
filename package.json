@@ -63,7 +63,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@mongodb-js/zstd": "^7.0.0",
     "@types/node": "^20.0.0",
+    "axios": "^1.16.1",
     "eslint": "^9.39.4",
     "tsup": "^8.0.0",
     "typescript": "^5.4.0",
@@ -71,6 +73,8 @@
     "vitest": "^1.6.0"
   },
   "peerDependencies": {
+    "@mongodb-js/zstd": ">=2.0.0",
+    "axios": ">=1.0.0",
     "express": "*",
     "ws": "*"
   },
@@ -79,14 +83,17 @@
     "provenance": true
   },
   "peerDependenciesMeta": {
+    "@mongodb-js/zstd": {
+      "optional": true
+    },
+    "axios": {
+      "optional": true
+    },
     "express": {
       "optional": true
     },
     "ws": {
       "optional": true
     }
-  },
-  "dependencies": {
-    "@mongodb-js/zstd": "^7.0.0"
   }
 }

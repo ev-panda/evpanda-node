@@ -6,8 +6,8 @@ import { decompress as zstdDecompress } from "@mongodb-js/zstd";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 // E2E against the built artifact — exactly what ships.
-import { EVPanda } from "../dist/index.js";
-import type { OCPIMessage } from "../dist/index.js";
+import { OCPIClient } from "../dist/index.js";
+import type { OCPIMessageInput } from "../dist/index.js";
 
 // ── Mock upstream ────────────────────────────────────────────────────────
 
@@ -85,10 +85,14 @@ async function waitFor(
   }
 }
 
-/** Valid OCPI message tagged with an index; carries a denylisted header. */
-const makeOCPI = (i: number): OCPIMessage => {
+/**
+ * Valid OCPI message tagged with an index. Carries both an unsafe header
+ * (`Authorization`, never on the OCPI allowlist) and one that *is* on the
+ * default allowlist (`x-correlation-id`) so we can prove the policy from
+ * both sides in one test.
+ */
+const makeOCPI = (i: number): OCPIMessageInput => {
   return {
-    direction: "inbound",
     identity: {
       platformId: "acme",
       platformName: "Acme Mobility",
@@ -99,7 +103,10 @@ const makeOCPI = (i: number): OCPIMessage => {
       method: "POST",
       url: `/ocpi/2.2/cdrs/${i}`,
       statusCode: 200,
-      requestHeaders: { Authorization: "Bearer SECRET", "X-Trace": String(i) },
+      requestHeaders: {
+        Authorization: "Bearer SECRET",
+        "x-correlation-id": String(i),
+      },
       responseHeaders: { "content-type": "application/json" },
       requestBody: new TextEncoder().encode(`body-${i}`),
     },
@@ -113,9 +120,9 @@ const ocpiRecords = (m: MockUpstream) =>
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-describe("EVPanda e2e", () => {
+describe("OCPIClient e2e", () => {
   let mock: MockUpstream;
-  let sdk: ReturnType<typeof EVPanda.start> | undefined;
+  let sdk: ReturnType<typeof OCPIClient.start> | undefined;
 
   beforeEach(async () => {
     mock = await startMockUpstream();
@@ -128,14 +135,13 @@ describe("EVPanda e2e", () => {
   });
 
   it("captures, batches on the timer, and the upstream receives all data (redacted & routed)", async () => {
-    sdk = EVPanda.start({
+    sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "test-key",
-      networkType: "ocpi",
       flushInterval: 100,
     });
 
-    for (let i = 0; i < 3; i++) sdk.captureOCPI(makeOCPI(i));
+    for (let i = 0; i < 3; i++) sdk.captureInboundMessage(makeOCPI(i));
 
     await waitFor(() => ocpiRecords(mock).length === 3);
 
@@ -162,7 +168,7 @@ describe("EVPanda e2e", () => {
       expect(rec.platform_name).toBe("Acme Mobility");
       expect(rec.tenant_id).toBe("t1");
       expect(rec.tenant_name).toBe("Tenant One");
-      expect(rec.direction).toBe("inbound");
+      expect(rec.direction).toBe("IN");
       expect(rec.http_method).toBe("POST");
       expect(rec.url).toBe(`/ocpi/2.2/cdrs/${i}`);
       // response_status_code always present.
@@ -172,10 +178,11 @@ describe("EVPanda e2e", () => {
       const reqHeaders = rec.request_headers as Record<string, string>;
       expect(typeof reqHeaders).toBe("object");
 
-      // Redaction: Authorization stripped (case-insensitive), others kept.
+      // Redaction policy: allowlist drops Authorization (not on the list),
+      // keeps x-correlation-id (on the default OCPI allowlist).
       const keys = Object.keys(reqHeaders).map((k) => k.toLowerCase());
       expect(keys).not.toContain("authorization");
-      expect(reqHeaders["X-Trace"]).toBe(String(i));
+      expect(reqHeaders["x-correlation-id"]).toBe(String(i));
 
       // Binary body round-trips as base64.
       expect(
@@ -185,17 +192,16 @@ describe("EVPanda e2e", () => {
   });
 
   it("compresses large batches with gzip and chunks at BATCH_CAP, in order", async () => {
-    sdk = EVPanda.start({
+    sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "k",
-      networkType: "ocpi",
       compression: "gzip",
       flushInterval: 100,
       bufferCapacity: 100_000,
     });
 
     const N = 2500;
-    for (let i = 0; i < N; i++) sdk.captureOCPI(makeOCPI(i));
+    for (let i = 0; i < N; i++) sdk.captureInboundMessage(makeOCPI(i));
 
     await waitFor(() => ocpiRecords(mock).length === N, 8000);
 
@@ -216,15 +222,14 @@ describe("EVPanda e2e", () => {
   }, 15000);
 
   it("caps the buffer at config.bufferCapacity (drop-oldest)", async () => {
-    sdk = EVPanda.start({
+    sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "k",
-      networkType: "ocpi",
       bufferCapacity: 5,
       flushInterval: 60_000, // no auto flush during the test
     });
 
-    for (let i = 0; i < 12; i++) sdk.captureOCPI(makeOCPI(i)); // 0..11
+    for (let i = 0; i < 12; i++) sdk.captureInboundMessage(makeOCPI(i)); // 0..11
     await sdk.flush(); // force one drain
 
     await waitFor(() => ocpiRecords(mock).length === 5);
@@ -242,14 +247,13 @@ describe("EVPanda e2e", () => {
   });
 
   it("flushes all pending messages to the upstream on close()", async () => {
-    sdk = EVPanda.start({
+    sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "k",
-      networkType: "ocpi",
       flushInterval: 60_000, // never auto-flushes within the test
     });
 
-    for (let i = 0; i < 4; i++) sdk.captureOCPI(makeOCPI(i));
+    for (let i = 0; i < 4; i++) sdk.captureInboundMessage(makeOCPI(i));
     expect(ocpiRecords(mock)).toHaveLength(0); // nothing sent yet
 
     await sdk.close(); // graceful drain
@@ -260,27 +264,26 @@ describe("EVPanda e2e", () => {
 
   it("never throws into the caller when the upstream fails", async () => {
     mock.status = 400; // permanent reject → dropped, no retry storm
-    sdk = EVPanda.start({
+    sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "k",
-      networkType: "ocpi",
       flushInterval: 60_000,
     });
 
     // Capture during a failing upstream — must not throw.
     for (let i = 0; i < 3; i++) {
-      expect(() => sdk?.captureOCPI(makeOCPI(i))).not.toThrow();
+      expect(() => sdk?.captureInboundMessage(makeOCPI(i))).not.toThrow();
     }
     // Malformed customer input — must not throw either (proxy swallows).
-    expect(() => sdk?.captureOCPI(undefined as never)).not.toThrow();
-    expect(() => sdk?.captureOCPI({} as never)).not.toThrow();
+    expect(() => sdk?.captureInboundMessage(undefined as never)).not.toThrow();
+    expect(() => sdk?.captureInboundMessage({} as never)).not.toThrow();
 
     // flush() resolves (never rejects) even though the upstream 400s.
     await expect(sdk.flush()).resolves.toBeUndefined();
     expect(mock.received.length).toBeGreaterThan(0); // it did attempt
 
     // The SDK is still usable afterwards.
-    expect(() => sdk?.captureOCPI(makeOCPI(99))).not.toThrow();
+    expect(() => sdk?.captureInboundMessage(makeOCPI(99))).not.toThrow();
     await expect(sdk.flush()).resolves.toBeUndefined();
   });
 });
