@@ -1,6 +1,6 @@
 # @evpanda/sdk
 
-[![Build](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml/badge.svg)](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml)
+[![Build](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml)
 
 Passive OCPI / OCPP traffic capture for Node. Embed it in your OCPI server or
 OCPP CSMS; it records protocol messages, buffers them in-process, and ships
