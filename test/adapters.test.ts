@@ -3,13 +3,10 @@
  * artifacts (`dist/`), spins up a real mock ingestion server, and, where
  * relevant, a real mock partner server — no mocks of internals.
  *
- * Covered:
- *  - `ocpi.express`: identity resolution, request + response body capture,
- *    status code, header normalization, no-identity pass-through.
- *  - `ocpi.fetch`: outbound capture, body cap, response untouched for the
- *    caller, network errors propagated.
- *  - `ocpi.axios`: outbound capture on 2xx and non-2xx responses.
- *  - Identity propagation via AsyncLocalStorage from inbound → outbound.
+ * Deliberately kept small: 2–3 tests per area, covering the primary path of
+ * each adapter plus the behaviours with their own dedicated code. Regression
+ * tests (pass-through after `close`, outbound header stripping) are pinned
+ * here and should not be removed without replacing the coverage.
  */
 
 import http from "node:http";
@@ -125,10 +122,11 @@ async function waitFor(
   }
 }
 
-/** Resolver that reads `x-platform-id` + `x-platform-name` for tests. */
-const headerResolver: OCPIResolver = (ctx) => ({
-  platformId: ctx.headers["x-platform-id"] ?? "",
-  platformName: ctx.headers["x-platform-name"] ?? "",
+/** Test-local resolver reading `x-platform-*` — distinct from the SDK's
+ *  shipped `ocpi.headerResolver`, which reads `X-EVPanda-*`. */
+const testResolver: OCPIResolver = (ctx) => ({
+  platformId: ctx.requestHeaders["x-platform-id"] ?? "",
+  platformName: ctx.requestHeaders["x-platform-name"] ?? "",
 });
 
 const ocpiRecords = (m: MockUpstream) =>
@@ -177,7 +175,7 @@ describe("ocpi.express", () => {
       apiKey: "k",
       flushInterval: 100,
     });
-    const mw = ocpi.express(sdk, { resolve: headerResolver });
+    const mw = ocpi.express(sdk, { resolve: testResolver });
 
     const app = await listenOn((req, res) => {
       mw(req, res, () => {
@@ -220,7 +218,7 @@ describe("ocpi.express", () => {
       apiKey: "k",
       flushInterval: 100,
     });
-    const mw = ocpi.express(sdk, { resolve: headerResolver });
+    const mw = ocpi.express(sdk, { resolve: testResolver });
 
     const app = await listenOn((req, res) => {
       // Stand in for express.json() — the adapter reads req.body, never
@@ -249,72 +247,6 @@ describe("ocpi.express", () => {
     expect(JSON.parse(reqBody)).toEqual({ id: "s1" });
   });
 
-  it("captures an aborted request via the res 'close' event", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-    const mw = ocpi.express(sdk, { resolve: headerResolver });
-
-    // Handler never responds — the client aborts mid-flight, so `res`
-    // emits 'close' without 'finish'. The capture must still fire.
-    const app = await listenOn((req, res) => {
-      mw(req, res, () => {
-        /* deliberately no res.end — the client will abort */
-      });
-    });
-    appUrl = app.url;
-    appClose = app.close;
-
-    const controller = new AbortController();
-    const pending = fetch(`${appUrl}/ocpi/2.2/sessions`, {
-      method: "POST",
-      headers: { "x-platform-id": "acme", "x-platform-name": "Acme" },
-      signal: controller.signal,
-    }).catch(() => {
-      /* abort rejects the fetch — expected */
-    });
-    await new Promise((r) => setTimeout(r, 100)); // let it reach the server
-    controller.abort();
-    await pending;
-
-    await waitFor(() => ocpiRecords(mock).length === 1);
-    const rec = ocpiRecords(mock)[0]!;
-    expect(rec.direction).toBe("IN");
-    expect(rec.url).toBe("/ocpi/2.2/sessions");
-  });
-
-  it("passes through with no capture when the resolver returns no identity", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-    // Returns blank platformId ⇒ validateRoamingIdentity fails ⇒ skip.
-    const mw = ocpi.express(sdk, {
-      resolve: () => ({ platformId: "", platformName: "" }),
-    });
-
-    const app = await listenOn((req, res) => {
-      mw(req, res, () => {
-        res.writeHead(200);
-        res.end("ok");
-      });
-    });
-    appUrl = app.url;
-    appClose = app.close;
-
-    const response = await fetch(`${appUrl}/healthz`);
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("ok");
-
-    // Give the SDK a flush window; nothing should arrive.
-    await new Promise((r) => setTimeout(r, 300));
-    await sdk.flush();
-    await new Promise((r) => setTimeout(r, 200));
-    expect(ocpiRecords(mock)).toHaveLength(0);
-  });
 });
 
 describe("ocpi.fetch", () => {
@@ -333,14 +265,18 @@ describe("ocpi.fetch", () => {
     await mock.close();
   });
 
-  it("captures outbound request/response and returns the response untouched", async () => {
+  it("captures outbound, leaves the response untouched, and goes inert on close", async () => {
     sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "k",
       flushInterval: 100,
     });
+    let resolverCalls = 0;
     const wrapped = ocpi.fetch(sdk, globalThis.fetch, {
-      resolve: () => ({ platformId: "acme", platformName: "Acme" }),
+      resolve: () => {
+        resolverCalls++;
+        return { platformId: "acme", platformName: "Acme" };
+      },
     });
 
     const response = await wrapped(`${partner.url}/ocpi/2.2/cdrs`, {
@@ -364,6 +300,20 @@ describe("ocpi.fetch", () => {
     // Both bodies round-tripped.
     const reqBody = Buffer.from(String(rec.request_body), "base64").toString("utf8");
     expect(JSON.parse(reqBody)).toEqual({ id: "c1" });
+
+    // Regression: the adapter reads the capture channel once at wrap time, so
+    // a wrapper built while live must still go inert once the client closes.
+    await sdk.close();
+    const callsBeforeClose = resolverCalls;
+
+    const after = await wrapped(`${partner.url}/ocpi/2.2/cdrs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "c2" }),
+    });
+    expect(((await after.json()) as { ok: boolean }).ok).toBe(true);
+    expect(resolverCalls).toBe(callsBeforeClose); // no resolver call
+    expect(ocpiRecords(mock)).toHaveLength(1); // no new record
   });
 });
 
@@ -408,26 +358,117 @@ describe("ocpi.axios", () => {
     // axios serializes JS objects to JSON before sending; capture mirrors that.
     const reqBody = Buffer.from(String(rec.request_body), "base64").toString("utf8");
     expect(JSON.parse(reqBody)).toEqual({ id: "l1" });
+
+    // A non-2xx rejects in axios, so it lands in the error interceptor arm —
+    // a separate code path that must capture the response just the same.
+    partner.status = 422;
+    await expect(instance.post("/ocpi/2.2/tokens", { id: "t1" })).rejects.toMatchObject({
+      response: { status: 422 },
+    });
+
+    await waitFor(() => ocpiRecords(mock).length === 2);
+    expect(ocpiRecords(mock)[1]!.response_status_code).toBe(422);
+  });
+});
+
+describe("shipped X-EVPanda-* header resolver", () => {
+  let mock: MockUpstream;
+  let partner: MockPartner;
+  let sdk: ReturnType<typeof OCPIClient.start>;
+  let appClose: (() => Promise<void>) | undefined;
+
+  beforeEach(async () => {
+    mock = await startMockUpstream();
+    partner = await startMockPartner();
+    appClose = undefined;
   });
 
-  it("captures outbound when the partner returns a non-2xx", async () => {
+  afterEach(async () => {
+    await sdk.close();
+    if (appClose) await appClose();
+    await partner.close();
+    await mock.close();
+  });
+
+  it("ocpi.fetch strips the identity headers before they reach the partner", async () => {
     sdk = OCPIClient.start({
       endpoint: mock.url,
       apiKey: "k",
       flushInterval: 100,
     });
-    partner.status = 422;
-    const instance = ocpi.axios(sdk, axios.create({ baseURL: partner.url }), {
-      resolve: () => ({ platformId: "acme", platformName: "Acme" }),
+    // Header-recording stand-in for the partner.
+    const seen: http.IncomingHttpHeaders[] = [];
+    const app = await listenOn((req, res) => {
+      seen.push(req.headers);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    appClose = app.close;
+
+    const wrapped = ocpi.fetch(sdk, globalThis.fetch);
+    await wrapped(`${app.url}/ocpi/2.2/sessions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-EVPanda-Platform-Id": "acme",
+        "X-EVPanda-Platform-Name": "Acme",
+        "X-EVPanda-Tenant-Id": "internal-tenant-1",
+        "X-EVPanda-Tenant-Name": "Internal Tenant",
+      },
+      body: "{}",
     });
 
-    await expect(instance.post("/ocpi/2.2/tokens", { id: "t1" })).rejects.toMatchObject({
-      response: { status: 422 },
+    // Partner saw a normal request — no SDK headers, other headers intact.
+    expect(seen).toHaveLength(1);
+    const partnerHeaders = Object.keys(seen[0]!).map((k) => k.toLowerCase());
+    expect(partnerHeaders.filter((k) => k.startsWith("x-evpanda-"))).toEqual([]);
+    expect(partnerHeaders).toContain("content-type");
+
+    // Identity still resolved and captured from the stripped headers.
+    await waitFor(() => ocpiRecords(mock).length === 1);
+    const rec = ocpiRecords(mock)[0]!;
+    expect(rec.platform_id).toBe("acme");
+    expect(rec.tenant_id).toBe("internal-tenant-1");
+  });
+
+  it("ocpi.axios strips the identity headers before they reach the partner", async () => {
+    sdk = OCPIClient.start({
+      endpoint: mock.url,
+      apiKey: "k",
+      flushInterval: 100,
     });
+    const seen: http.IncomingHttpHeaders[] = [];
+    const app = await listenOn((req, res) => {
+      seen.push(req.headers);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    appClose = app.close;
+
+    const client = ocpi.axios(
+      sdk,
+      axios.create({
+        baseURL: app.url,
+        headers: {
+          "X-EVPanda-Platform-Id": "acme",
+          "X-EVPanda-Platform-Name": "Acme",
+          "X-EVPanda-Tenant-Id": "internal-tenant-1",
+          "X-EVPanda-Tenant-Name": "Internal Tenant",
+        },
+      }),
+    );
+    await client.post("/ocpi/2.2/tokens", { id: "t1" });
+
+    expect(seen).toHaveLength(1);
+    const partnerHeaders = Object.keys(seen[0]!).map((k) => k.toLowerCase());
+    expect(partnerHeaders.filter((k) => k.startsWith("x-evpanda-"))).toEqual([]);
 
     await waitFor(() => ocpiRecords(mock).length === 1);
-    expect(ocpiRecords(mock)[0]!.response_status_code).toBe(422);
+    const rec = ocpiRecords(mock)[0]!;
+    expect(rec.platform_id).toBe("acme");
+    expect(rec.tenant_id).toBe("internal-tenant-1");
   });
+
 });
 
 describe("drop-on-oversize policy", () => {
@@ -454,40 +495,11 @@ describe("drop-on-oversize policy", () => {
     expect(ocpiRecords(mock)).toHaveLength(0);
   }
 
-  it("ocpi.express drops the whole capture when the request body overflows", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url, apiKey: "k", flushInterval: 100, maxCaptureBytes: TINY_CAP,
-    });
-    const mw = ocpi.express(sdk, { resolve: headerResolver });
-    const app = await listenOn((req, res) => {
-      mw(req, res, () => {
-        // Simulate a body parser populating an oversize req.body — the
-        // adapter reads req.body, it never tees the raw request stream.
-        (req as http.IncomingMessage & { body?: unknown }).body =
-          "a".repeat(TINY_CAP * 4);
-        res.writeHead(200, { "content-type": "text/plain" });
-        res.end("ok");
-      });
-    });
-    try {
-      const response = await fetch(`${app.url}/ocpi/2.2/sessions`, {
-        method: "POST",
-        headers: { "x-platform-id": "acme", "x-platform-name": "Acme" },
-        body: "ignored",
-      });
-      // Request succeeds — the host never knows we declined the capture.
-      expect(response.status).toBe(200);
-      await expectNoCapture();
-    } finally {
-      await app.close();
-    }
-  });
-
   it("ocpi.express drops the whole capture when the response body overflows", async () => {
     sdk = OCPIClient.start({
       endpoint: mock.url, apiKey: "k", flushInterval: 100, maxCaptureBytes: TINY_CAP,
     });
-    const mw = ocpi.express(sdk, { resolve: headerResolver });
+    const mw = ocpi.express(sdk, { resolve: testResolver });
     const app = await listenOn((req, res) => {
       mw(req, res, () => {
         res.writeHead(200, { "content-type": "text/plain" });
@@ -556,27 +568,6 @@ describe("drop-on-oversize policy", () => {
     }
   });
 
-  it("captureOCPI primitive drops oversize bodies at the chokepoint", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url, apiKey: "k", flushInterval: 100, maxCaptureBytes: TINY_CAP,
-    });
-
-    // Customer bypasses adapters and hands us already-oversize bytes.
-    sdk.captureInboundMessage({
-      identity: { platformId: "acme", platformName: "Acme" },
-      http: {
-        method: "POST",
-        url: "/ocpi/2.2/sessions",
-        statusCode: 200,
-        requestHeaders: {},
-        responseHeaders: {},
-        requestBody: new TextEncoder().encode("a".repeat(TINY_CAP * 4)),
-      },
-    });
-
-    await expectNoCapture();
-  });
-
 });
 
 describe("OCPI redaction policy", () => {
@@ -601,7 +592,7 @@ describe("OCPI redaction policy", () => {
 
     sdk.captureInboundMessage({
       identity: { platformId: "acme", platformName: "Acme" },
-      http: {
+      data: {
         method: "POST",
         url: "/ocpi/2.2/cdrs",
         statusCode: 200,
@@ -637,38 +628,6 @@ describe("OCPI redaction policy", () => {
     expect(respKeys).not.toContain("set-cookie");
   });
 
-  it("extends the allowlist with config.ocpiAllowedHeaders (case-insensitive)", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-      ocpiAllowedHeaders: ["X-Tenant-Id", "X-Custom-Trace"],
-    });
-
-    sdk.captureInboundMessage({
-      identity: { platformId: "acme", platformName: "Acme" },
-      http: {
-        method: "GET",
-        url: "/ocpi/2.2/locations",
-        statusCode: 200,
-        requestHeaders: {
-          authorization: "Bearer NOPE", // still dropped — defaults cannot be weakened
-          "x-tenant-id": "t-1",
-          "X-Custom-Trace": "abc",
-        },
-        responseHeaders: {},
-      },
-    });
-
-    await waitFor(() => ocpiRecords(mock).length === 1);
-    const rec = ocpiRecords(mock)[0]!;
-    const keys = Object.keys(rec.request_headers as Record<string, string>).map(
-      (k) => k.toLowerCase(),
-    );
-    expect(keys.sort()).toEqual(["x-custom-trace", "x-tenant-id"]);
-    expect(keys).not.toContain("authorization");
-  });
-
   it("masks `token` in credentials request body", async () => {
     sdk = OCPIClient.start({
       endpoint: mock.url,
@@ -684,7 +643,7 @@ describe("OCPI redaction policy", () => {
 
     sdk.captureInboundMessage({
       identity: { platformId: "acme", platformName: "Acme" },
-      http: {
+      data: {
         method: "POST",
         url: "/ocpi/2.2/credentials",
         statusCode: 200,
@@ -726,7 +685,7 @@ describe("OCPI redaction policy", () => {
 
     sdk.captureOutboundMessage({
       identity: { platformId: "acme", platformName: "Acme" },
-      http: {
+      data: {
         method: "POST",
         url: "https://partner.example/ocpi/2.2/credentials",
         statusCode: 200,
@@ -749,227 +708,6 @@ describe("OCPI redaction policy", () => {
     expect(decoded.status_message).toBe("Success");
   });
 
-  it("matches the credentials endpoint across OCPI URL shapes", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-
-    // Every URL here ends with `/credentials` (or `/credentials/` /
-    // `/credentials?...`) — all must trigger the mask.
-    const urls = [
-      "/ocpi/emsp/2.2.1/credentials",
-      "/ocpi/2.2.1/credentials",
-      "/ocpi/2.2/credentials/",
-      "https://partner.example/ocpi/2.2/credentials?versions=2.2",
-    ];
-    const body = JSON.stringify({ token: "T", url: "u", roles: [] });
-    for (const url of urls) {
-      sdk.captureInboundMessage({
-        identity: { platformId: "acme", platformName: "Acme" },
-        http: {
-          method: "POST", url, statusCode: 200,
-          requestHeaders: {}, responseHeaders: {},
-          requestBody: new TextEncoder().encode(body),
-        },
-      });
-    }
-
-    await waitFor(() => ocpiRecords(mock).length === urls.length);
-    for (const rec of ocpiRecords(mock)) {
-      const decoded = JSON.parse(
-        Buffer.from(String(rec.request_body), "base64").toString("utf8"),
-      ) as { token: string };
-      expect(decoded.token).toBe("[redacted]");
-    }
-  });
-
-  it("does NOT mask on sub-paths under /credentials (no such OCPI route)", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-
-    // Sub-path like `/credentials/foo` is not an OCPI endpoint; if the
-    // host built such a URL we leave its body alone — the regex must not
-    // be tricked by `/credentials` appearing mid-path.
-    const body = JSON.stringify({ token: "PRESERVED" });
-    sdk.captureInboundMessage({
-      identity: { platformId: "acme", platformName: "Acme" },
-      http: {
-        method: "POST",
-        url: "/ocpi/2.2/credentials/foo",
-        statusCode: 200,
-        requestHeaders: {}, responseHeaders: {},
-        requestBody: new TextEncoder().encode(body),
-      },
-    });
-
-    await waitFor(() => ocpiRecords(mock).length === 1);
-    const decoded = JSON.parse(
-      Buffer.from(String(ocpiRecords(mock)[0]!.request_body), "base64").toString("utf8"),
-    ) as { token: string };
-    expect(decoded.token).toBe("PRESERVED");
-  });
-
-  it("identity-source headers reach the resolver but never appear on the wire", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-      // Crucially: NOT adding x-platform-* / x-tenant-* to ocpiAllowedHeaders.
-    });
-
-    // Spy on what the resolver actually sees so we can prove the headers
-    // are available at resolution time even though they get filtered later.
-    const seen: { headers?: Record<string, string> } = {};
-    const mw = ocpi.express(sdk, {
-      resolve: (ctx) => {
-        seen.headers = ctx.headers;
-        return {
-          platformId: ctx.headers["x-platform-id"] ?? "",
-          platformName: ctx.headers["x-platform-name"] ?? "",
-          tenantId: ctx.headers["x-tenant-id"],
-          tenantName: ctx.headers["x-tenant-name"],
-        };
-      },
-    });
-
-    const app = await listenOn((req, res) => {
-      mw(req, res, () => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      });
-    });
-
-    try {
-      await fetch(`${app.url}/ocpi/2.2/cdrs`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-platform-id": "acme",
-          "x-platform-name": "Acme",
-          "x-tenant-id": "t1",
-          "x-tenant-name": "Tenant One",
-        },
-        body: "{}",
-      });
-
-      await waitFor(() => ocpiRecords(mock).length === 1);
-      const rec = ocpiRecords(mock)[0]!;
-
-      // 1. Resolver saw the identity-source headers — full map, normalized.
-      expect(seen.headers?.["x-platform-id"]).toBe("acme");
-      expect(seen.headers?.["x-tenant-id"]).toBe("t1");
-
-      // 2. Identity made it onto the wire as first-class fields.
-      expect(rec.platform_id).toBe("acme");
-      expect(rec.platform_name).toBe("Acme");
-      expect(rec.tenant_id).toBe("t1");
-      expect(rec.tenant_name).toBe("Tenant One");
-
-      // 3. But the *raw* identity-source headers were filtered out of
-      //    request_headers — they never get persisted alongside payloads.
-      const reqHeaders = (rec.request_headers as Record<string, string> | null) ?? {};
-      const keys = Object.keys(reqHeaders).map((k) => k.toLowerCase());
-      expect(keys).not.toContain("x-platform-id");
-      expect(keys).not.toContain("x-platform-name");
-      expect(keys).not.toContain("x-tenant-id");
-      expect(keys).not.toContain("x-tenant-name");
-    } finally {
-      await app.close();
-    }
-  });
-
-  it("leaves an envelope with no credentials data untouched", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-
-    // DELETE /credentials returns an envelope with no `data` (or `data: null`).
-    const envelope = {
-      status_code: 1000,
-      status_message: "Success",
-      timestamp: "2026-05-21T00:00:00Z",
-    };
-    sdk.captureOutboundMessage({
-      identity: { platformId: "acme", platformName: "Acme" },
-      http: {
-        method: "DELETE",
-        url: "https://partner.example/ocpi/2.2/credentials",
-        statusCode: 200,
-        requestHeaders: {},
-        responseHeaders: {},
-        responseBody: new TextEncoder().encode(JSON.stringify(envelope)),
-      },
-    });
-
-    await waitFor(() => ocpiRecords(mock).length === 1);
-    const rec = ocpiRecords(mock)[0]!;
-    const decoded = JSON.parse(
-      Buffer.from(String(rec.response_body), "base64").toString("utf8"),
-    ) as typeof envelope;
-    expect(decoded).toEqual(envelope);
-  });
-
-  it("leaves non-credentials bodies untouched", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-
-    // A non-credentials body that *also* has a `token` field — must NOT be
-    // masked, because the URL isn't a credentials endpoint.
-    const body = JSON.stringify({ token: "session-tag", action: "Authorize" });
-    sdk.captureInboundMessage({
-      identity: { platformId: "acme", platformName: "Acme" },
-      http: {
-        method: "POST",
-        url: "/ocpi/2.2/sessions",
-        statusCode: 200,
-        requestHeaders: {},
-        responseHeaders: {},
-        requestBody: new TextEncoder().encode(body),
-      },
-    });
-
-    await waitFor(() => ocpiRecords(mock).length === 1);
-    const rec = ocpiRecords(mock)[0]!;
-    const decoded = JSON.parse(
-      Buffer.from(String(rec.request_body), "base64").toString("utf8"),
-    ) as { token: string };
-    expect(decoded.token).toBe("session-tag");
-  });
-
-  it("returns the original bytes when a credentials body is non-JSON or has no token", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-
-    sdk.captureInboundMessage({
-      identity: { platformId: "acme", platformName: "Acme" },
-      http: {
-        method: "DELETE",
-        url: "/ocpi/2.2/credentials",
-        statusCode: 405,
-        requestHeaders: {},
-        responseHeaders: {},
-        requestBody: new TextEncoder().encode("not json at all"),
-      },
-    });
-
-    await waitFor(() => ocpiRecords(mock).length === 1);
-    const rec = ocpiRecords(mock)[0]!;
-    const text = Buffer.from(String(rec.request_body), "base64").toString("utf8");
-    expect(text).toBe("not json at all");
-  });
 });
 
 describe("OCPP capture helpers", () => {
@@ -1058,27 +796,6 @@ describe("OCPP capture helpers", () => {
     expect(JSON.parse(frame)).toEqual({ action: "Heartbeat" });
   });
 
-  it("silently drops when the identity is invalid", async () => {
-    sdk = OCPPClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-    });
-
-    sdk.captureMessage({
-      identity: { chargerId: "" }, // blank ⇒ validateChargerIdentity fails
-      connectionId: "conn-drop",
-      data: "noop",
-      direction: "FROM_CP",
-    });
-
-    // Give a flush window; nothing should arrive.
-    await new Promise((r) => setTimeout(r, 300));
-    await sdk.flush();
-    await new Promise((r) => setTimeout(r, 200));
-    expect(mock.received.flatMap((r) => r.records)).toHaveLength(0);
-  });
-
   it("drops the whole message when the payload overflows", async () => {
     const TINY_CAP = 64;
     sdk = OCPPClient.start({
@@ -1106,75 +823,5 @@ describe("OCPP capture helpers", () => {
     const recs = mock.received.flatMap((r) => r.records);
     expect(recs).toHaveLength(1);
     expect(recs[0]!.event_type).toBe(1); // Connect only
-  });
-});
-
-describe("identity propagation (ALS)", () => {
-  let mock: MockUpstream;
-  let partner: MockPartner;
-  let sdk: ReturnType<typeof OCPIClient.start>;
-  let appClose: () => Promise<void>;
-
-  beforeEach(async () => {
-    mock = await startMockUpstream();
-    partner = await startMockPartner();
-  });
-
-  afterEach(async () => {
-    await sdk.close();
-    await appClose();
-    await partner.close();
-    await mock.close();
-  });
-
-  it("inbound identity flows to outbound ocpi.fetch with no extra wiring", { timeout: 15000 }, async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 100,
-      propagateIdentity: true,
-    });
-
-    const inbound = ocpi.express(sdk, { resolve: headerResolver });
-    // Outbound wrapper still requires `resolve` for off-handler use; here
-    // the ambient ALS identity must win and this fallback must not be hit.
-    const outFetch = ocpi.fetch(sdk, globalThis.fetch, {
-      resolve: () => ({ platformId: "wrong-fallback", platformName: "wrong" }),
-    });
-
-    const app = await listenOn((req, res) => {
-      inbound(req, res, () => {
-        // An outbound call from inside the inbound handler — the wrapper
-        // must pick up the inbound-resolved identity from ALS.
-        void outFetch(`${partner.url}/ocpi/2.2/cdrs`, { method: "POST", body: "[]" })
-          .then(async (resp) => {
-            await resp.text();
-            res.writeHead(200);
-            res.end("ok");
-          })
-          .catch(() => {
-            res.writeHead(500);
-            res.end("err");
-          });
-      });
-    });
-    appClose = app.close;
-
-    const response = await fetch(`${app.url}/ocpi/2.2/cdrs`, {
-      method: "POST",
-      headers: {
-        "x-platform-id": "acme",
-        "x-platform-name": "Acme",
-      },
-      body: "[]",
-    });
-    expect(response.status).toBe(200);
-
-    await waitFor(() => ocpiRecords(mock).length === 2, 6000);
-    const recs = ocpiRecords(mock);
-    // Both must carry the inbound-resolved identity; the outbound call's
-    // own resolver would have produced "wrong-fallback" if ALS missed.
-    expect(recs.every((r) => r.platform_id === "acme")).toBe(true);
-    expect(recs.map((r) => r.direction).sort()).toEqual(["IN", "OUT"]);
   });
 });

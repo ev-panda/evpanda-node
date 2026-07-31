@@ -10,13 +10,10 @@
  * the adapter never tees the raw request stream, since a `'data'` listener
  * would flip it to flowing mode and could starve the host's own parser.
  * `express.raw()` yields exact bytes; `express.json()` a re-serialized form.
- *
- * With `propagateIdentity: true` the resolved identity is set as the ambient
- * ALS value, so `ocpi.fetch` / `ocpi.axios` calls in the handler inherit it.
  */
 
-import { readBridge } from "../../internal/bridge.js";
 import {
+  headerResolver,
   normalizeIncomingHeaders,
   normalizeOutgoingHeaders,
   safeResolve,
@@ -26,11 +23,15 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Logger } from "../../config.js";
 import type { OCPIResolver, RoamingIdentity } from "../../identity.js";
 import type { OCPIClient } from "../client.js";
-import type { CapturedHttp } from "../../types.js";
+import type { HttpExchange } from "../../types.js";
 
 export interface OCPIExpressOptions {
-  /** Identity resolver. Required — no default header reader is shipped. */
-  resolve: OCPIResolver;
+  /**
+   * Identity resolver. Omitted ⇒ the shipped `X-EVPanda-*` header reader,
+   * which requires earlier middleware to stamp those headers — inbound
+   * partner requests will not carry them on their own.
+   */
+  resolve?: OCPIResolver;
 }
 
 type Next = (err?: unknown) => void;
@@ -48,21 +49,31 @@ function wirePath(req: IncomingMessage): string {
 }
 
 /** Returns an express/connect-compatible `(req, res, next)` middleware. */
-export function express(sdk: OCPIClient, opts: OCPIExpressOptions): Middleware {
-  const bridge = readBridge(sdk);
+export function express(
+  sdk: OCPIClient,
+  opts: OCPIExpressOptions = {},
+): Middleware {
+  const bridge = sdk._internal;
   // Inert SDK: cheapest possible pass-through. No resolver call, no patching.
   if (!bridge) return (_req, _res, next) => next();
 
-  const { maxCaptureBytes, identityStore, logger } = bridge;
-  const { resolve } = opts;
+  const { maxCaptureBytes, logger } = bridge;
+  const { resolve = headerResolver } = opts;
 
   return (req, res, next) => {
+    // Re-checked per request: a closed client passes straight through, with
+    // no resolver call and no response patching.
+    if (!sdk._internal) {
+      next();
+      return;
+    }
+
     let identity: RoamingIdentity | undefined;
     try {
       identity = safeResolve(resolve, {
         method: req.method ?? "",
         url: wirePath(req),
-        headers: normalizeIncomingHeaders(req.headers),
+        requestHeaders: normalizeIncomingHeaders(req.headers),
       });
     } catch (err) {
       // safeResolve already guards; this is belt-and-braces.
@@ -79,12 +90,7 @@ export function express(sdk: OCPIClient, opts: OCPIExpressOptions): Middleware {
     }
 
     instrument(sdk, req, res, identity, maxCaptureBytes, logger);
-
-    if (identityStore) {
-      identityStore.run(identity, () => next());
-    } else {
-      next();
-    }
+    next();
   };
 }
 
@@ -145,7 +151,7 @@ function instrument(
         // Oversize either side ⇒ drop the whole message; a half-body is
         // broken JSON and would defeat the credentials redactor.
         if (reqBody.overflowed || resBody.overflowed) return;
-        const http: CapturedHttp = {
+        const data: HttpExchange = {
           method: req.method ?? "",
           url: wirePath(req),
           // Omit the status when headers never went out — `res.statusCode`
@@ -156,7 +162,7 @@ function instrument(
           requestBody: reqBody.body,
           responseBody: bodyValue(resBody),
         };
-        sdk.captureInboundMessage({ identity, http });
+        sdk.captureInboundMessage({ identity, data });
       } catch (err) {
         logger?.warn("@evpanda/sdk: OCPI inbound capture failed", {
           error: String(err),

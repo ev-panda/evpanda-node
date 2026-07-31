@@ -37,15 +37,14 @@ export class RingBuffer {
   }
 
   /** Return live slots oldest→newest; clear refs + reset. */
-  drain(): BufferedMessage[] {
-    const out: BufferedMessage[] = new Array<BufferedMessage>(this._count);
+  flush(): BufferedMessage[] {
+    const out: BufferedMessage[] = [];
     for (let i = 0; i < this._count; i++) {
       const idx = (this._head + i) % this._capacity;
       const msg = this._buf[idx];
-      if (msg === undefined) {
-        throw new Error(`Invariant violation: expected BufferedMessage at buffer index ${idx}`);
-      }
-      out[i] = msg;
+      // Live slots are always populated; skip rather than throw, so a broken
+      // invariant can never take out a flush cycle.
+      if (msg !== undefined) out.push(msg);
       this._buf[idx] = undefined; // release ref
     }
     this._head = 0;

@@ -112,7 +112,13 @@ function headersJSON(
   return h;
 }
 
-/** base64-encode a body/frame, or null when empty. */
+/**
+ * base64-encode a body/frame, or null when empty. Used for every byte
+ * payload the SDK ships — OCPI HTTP bodies AND OCPP wire frames. The
+ * ingest server decodes before persistence (so DB / consumers see plain
+ * UTF-8 for OCPP, raw bytes for OCPI). Rationale: keeps the wire contract
+ * uniform across protocols and binary-safe for any future payload.
+ */
 function bodyB64(b: Uint8Array | undefined): string | null {
   if (b === undefined || b.byteLength === 0) return null;
   return Buffer.from(b).toString("base64");
@@ -129,7 +135,7 @@ function optInt(n: number | undefined): number | null {
 }
 
 function isOCPI(m: OCPIMessage | OCPPMessage): m is OCPIMessage {
-  return "http" in m;
+  return "data" in m;
 }
 
 function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
@@ -140,13 +146,13 @@ function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
     tenant_id: optStr(m.identity.tenantId),
     tenant_name: optStr(m.identity.tenantName),
     direction: m.direction,
-    http_method: m.http.method,
-    url: m.http.url,
-    response_status_code: optInt(m.http.statusCode),
-    request_headers: headersJSON(m.http.requestHeaders),
-    request_body: bodyB64(m.http.requestBody),
-    response_headers: headersJSON(m.http.responseHeaders),
-    response_body: bodyB64(m.http.responseBody),
+    http_method: m.data.method,
+    url: m.data.url,
+    response_status_code: optInt(m.data.statusCode),
+    request_headers: headersJSON(m.data.requestHeaders),
+    request_body: bodyB64(m.data.requestBody),
+    response_headers: headersJSON(m.data.responseHeaders),
+    response_body: bodyB64(m.data.responseBody),
   };
 }
 
@@ -227,7 +233,7 @@ export class Transport {
    * Encode with the configured codec — identity for tiny payloads, gzip if
    * zstd is requested but its optional peer is absent, identity on failure.
    */
-  private async compress(
+  private async _compress(
     raw: Uint8Array,
   ): Promise<{ body: Uint8Array; encoding: ContentEncoding }> {
     if (raw.byteLength < COMPRESS_MIN_BYTES) {
@@ -258,7 +264,7 @@ export class Transport {
     let body: Uint8Array;
     let encoding: ContentEncoding;
     try {
-      ({ body, encoding } = await this.compress(serialize(batch)));
+      ({ body, encoding } = await this._compress(serialize(batch)));
     } catch {
       return; // unserializable batch is dropped
     }
@@ -291,18 +297,12 @@ export class Transport {
       }
     }
     // retries exhausted → batch dropped (loss acceptable by design)
-    if (lastStatus !== 0) {
-      this._logDrop(
-        protocol,
-        batch.length,
-        `retries exhausted (last HTTP ${lastStatus})`,
-      );
-    } else {
-      this._logDrop(
-        protocol,
-        batch.length,
-        "retries exhausted (network error / timeout)",
-      );
-    }
+    this._logDrop(
+      protocol,
+      batch.length,
+      lastStatus !== 0
+        ? `retries exhausted (last HTTP ${lastStatus})`
+        : "retries exhausted (network error / timeout)",
+    );
   }
 }

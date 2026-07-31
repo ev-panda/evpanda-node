@@ -3,9 +3,9 @@
  *
  * Attaches a request + response interceptor pair to the customer's
  * `AxiosInstance` (returned for fluent wiring). The request hook resolves
- * identity (ALS first, then `resolve`) and stashes it + the request body on
- * the config; the response hook assembles and ships the message. The error
- * hook captures non-2xx responses; pure network errors are not captured.
+ * identity via `resolve` and stashes it + the request body on the config;
+ * the response hook assembles and ships the message. The error hook
+ * captures non-2xx responses; pure network errors are not captured.
  *
  * Body bytes: `config.data` / `response.data` are axios's pre-/post-
  * serializer forms — objects are re-serialized to JSON, since that is what
@@ -15,8 +15,11 @@
  * runtime bundle never references it.
  */
 
-import { readBridge } from "../../internal/bridge.js";
-import { safeResolve } from "./resolver.js";
+import {
+  IDENTITY_HEADER_NAMES,
+  headerResolver,
+  safeResolve,
+} from "./resolver.js";
 
 import type {
   AxiosError,
@@ -27,14 +30,14 @@ import type {
 import type { Logger } from "../../config.js";
 import type { OCPIResolver, RoamingIdentity } from "../../identity.js";
 import type { OCPIClient } from "../client.js";
-import type { CapturedHttp } from "../../types.js";
+import type { HttpExchange } from "../../types.js";
 
 export interface OCPIAxiosOptions {
   /**
-   * Identity resolver. Required as a fallback even when `propagateIdentity`
-   * is on — calls made outside an inbound request have no ambient identity.
+   * Identity resolver, invoked for every outbound request. Omitted ⇒ the
+   * shipped `X-EVPanda-*` header reader.
    */
-  resolve: OCPIResolver;
+  resolve?: OCPIResolver;
 }
 
 /** Carried on `config` from request → response so capture can re-assemble. */
@@ -55,22 +58,23 @@ type ConfigWithStash = InternalAxiosRequestConfig & { [STASH]?: Stash };
 export function axios(
   sdk: OCPIClient,
   instance: AxiosInstance,
-  opts: OCPIAxiosOptions,
+  opts: OCPIAxiosOptions = {},
 ): AxiosInstance {
-  const bridge = readBridge(sdk);
+  const bridge = sdk._internal;
   // Inert SDK: skip both interceptors entirely — zero overhead per call.
   if (!bridge) return instance;
 
-  const { maxCaptureBytes, identityStore, logger } = bridge;
-  const { resolve } = opts;
+  const { maxCaptureBytes, logger } = bridge;
+  const { resolve = headerResolver } = opts;
 
   instance.interceptors.request.use((config) => {
+    // Interceptors can't be unregistered, so a closed client is skipped here.
+    if (!sdk._internal) return config;
     try {
-      let identity: RoamingIdentity | undefined = identityStore?.current();
-      identity ??= safeResolve(resolve, {
+      const identity: RoamingIdentity | undefined = safeResolve(resolve, {
         method: (config.method ?? "get").toUpperCase(),
         url: safeGetUri(instance, config),
-        headers: axiosHeadersToRecord(config.headers),
+        requestHeaders: axiosHeadersToRecord(config.headers),
       });
       if (identity) {
         const r = bodyToBytes(config.data, maxCaptureBytes);
@@ -86,18 +90,23 @@ export function axios(
         error: String(err),
       });
     }
+    // Outside the try: strip even when resolution failed, so the identity
+    // headers can never reach the partner.
+    stripIdentityHeaders(config.headers);
     return config;
   });
 
   instance.interceptors.response.use(
     (response) => {
-      tryEmit(sdk, instance, response.config, response, maxCaptureBytes, logger);
+      if (sdk._internal) {
+        tryEmit(sdk, instance, response.config, response, maxCaptureBytes, logger);
+      }
       return response;
     },
     (error: AxiosError) => {
       // Only capture when the partner responded (non-2xx). Pass
       // `error.config` explicitly — don't mutate the customer's error.
-      if (error.response && error.config) {
+      if (sdk._internal && error.response && error.config) {
         tryEmit(sdk, instance, error.config, error.response, maxCaptureBytes, logger);
       }
       return Promise.reject(error);
@@ -123,7 +132,7 @@ function tryEmit(
     if (stash.reqOverflowed) return;
     const resp = bodyToBytes(response.data, maxCaptureBytes);
     if (resp.overflowed) return;
-    const http: CapturedHttp = {
+    const data: HttpExchange = {
       method: (config.method ?? "get").toUpperCase(),
       url: safeGetUri(instance, config),
       statusCode: response.status,
@@ -132,7 +141,7 @@ function tryEmit(
       requestBody: stash.requestBody,
       responseBody: resp.body,
     };
-    sdk.captureOutboundMessage({ identity: stash.identity, http });
+    sdk.captureOutboundMessage({ identity: stash.identity, data });
   } catch (err) {
     logger?.warn("@evpanda/sdk: OCPI axios capture failed", {
       error: String(err),
@@ -149,6 +158,25 @@ function safeGetUri(
     return instance.getUri(config);
   } catch {
     return config.url ?? "";
+  }
+}
+
+/**
+ * Remove the SDK's identity headers from an axios header bag before the
+ * request goes out. `AxiosHeaders` exposes a case-insensitive `delete()`;
+ * a plain object is swept case-insensitively by key.
+ */
+function stripIdentityHeaders(h: unknown): void {
+  if (h == null || typeof h !== "object") return;
+  const bag = h as {
+    delete?: (name: string) => void;
+  } & Record<string, unknown>;
+  if (typeof bag.delete === "function") {
+    for (const name of IDENTITY_HEADER_NAMES) bag.delete(name);
+    return;
+  }
+  for (const key of Object.keys(bag)) {
+    if (IDENTITY_HEADER_NAMES.includes(key.toLowerCase())) delete bag[key];
   }
 }
 

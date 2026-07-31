@@ -9,7 +9,7 @@
  *      envelope) is replaced with `[redacted]`.
  */
 
-import type { CapturedHttp, OCPIMessage } from "../types.js";
+import type { HttpExchange, OCPIMessage } from "../types.js";
 
 /** Stock OCPI headers safe to capture — none of these can carry a secret. */
 const DEFAULT_OCPI_HEADER_ALLOWLIST: readonly string[] = [
@@ -55,17 +55,17 @@ export function makeOCPIRedactor(
       h.toLowerCase(),
     ),
   );
-  return (msg) => ({ ...msg, http: redactHttp(msg.http, allow) });
+  return (msg) => ({ ...msg, data: redactHttp(msg.data, allow) });
 }
 
 /** Apply the allowlist + credentials-token mask to a captured HTTP envelope. */
-function redactHttp(http: CapturedHttp, allow: Set<string>): CapturedHttp {
+function redactHttp(data: HttpExchange, allow: Set<string>): HttpExchange {
   return {
-    ...http,
-    requestHeaders: filterHeaders(http.requestHeaders, allow),
-    responseHeaders: filterHeaders(http.responseHeaders, allow),
-    requestBody: maskCredentialsToken(http.requestBody, http.url),
-    responseBody: maskCredentialsToken(http.responseBody, http.url),
+    ...data,
+    requestHeaders: filterHeaders(data.requestHeaders, allow),
+    responseHeaders: filterHeaders(data.responseHeaders, allow),
+    requestBody: maskCredentialsToken(data.requestBody, data.url),
+    responseBody: maskCredentialsToken(data.responseBody, data.url),
   };
 }
 

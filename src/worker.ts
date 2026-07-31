@@ -4,8 +4,8 @@
  * (which owns retry). Also owns the bounded shutdown drain. Never throws.
  *
  * Worker is also the producer chokepoint — `captureOCPI` / `captureOCPP`
- * delegate to the `processOCPI` / `processOCPP` helpers at the bottom of
- * the file, keeping the validate/cap/redact logic out of the class body.
+ * delegate to the pure `prepareOCPI` / `prepareOCPP` helpers at the bottom
+ * of the file, keeping the validate/cap/redact logic out of the class body.
  */
 
 import {
@@ -15,8 +15,8 @@ import {
 
 import type { BufferedMessage, RingBuffer } from "./buffer.js";
 import type { ResolvedConfig } from "./config.js";
-import type { OCPIRedactor } from "./internal/ocpi-redact.js";
-import type { OCPPRedactor } from "./internal/ocpp-redact.js";
+import type { OCPIRedactor } from "./ocpi/redact.js";
+import type { OCPPRedactor } from "./ocpp/redact.js";
 import type { Transport } from "./transport.js";
 import type { OCPIMessage, OCPPMessage } from "./types.js";
 
@@ -46,59 +46,59 @@ export class Worker {
     this._schedule();
   }
 
-  /** Producer entry point for OCPI; see `processOCPI`. */
+  /** Producer entry point for OCPI; see `prepareOCPI`. */
   captureOCPI(msg: OCPIMessage, redact: OCPIRedactor): void {
-    processOCPI(this, msg, redact, this._config.maxCaptureBytes);
+    const env = prepareOCPI(msg, redact, this._config.maxCaptureBytes);
+    if (env !== null) this._buffer.enqueue(env);
   }
 
-  /** Producer entry point for OCPP; see `processOCPP`. */
+  /** Producer entry point for OCPP; see `prepareOCPP`. */
   captureOCPP(msg: OCPPMessage, redact: OCPPRedactor): void {
-    processOCPP(this, msg, redact, this._config.maxCaptureBytes);
+    const env = prepareOCPP(msg, redact, this._config.maxCaptureBytes);
+    if (env !== null) this._buffer.enqueue(env);
   }
 
   /** Single-flight: a concurrent call joins the in-flight flush. */
   flushOnce(): Promise<void> {
     if (this._inflight) return this._inflight;
+    // Safe to null unconditionally: while `p` is pending every caller gets
+    // it back, so nothing can install a different promise before this runs.
     const p = this._runFlush().finally(() => {
-      if (this._inflight === p) this._inflight = null;
+      this._inflight = null;
     });
     this._inflight = p;
     return p;
   }
 
-  /** Stop the timer only. No drain — close() owns the final drain. */
-  stop(): void {
-    this._stopped = true;
-    if (this._timer !== undefined) {
-      clearTimeout(this._timer);
-      this._timer = undefined;
-    }
-  }
-
   /** One-shot, idempotent: await in-flight, bounded final drain, stop. */
   async close(deadlineMs?: number): Promise<void> {
     if (this._stopped) return;
-    this.stop();
+    this._stop();
     const ms = deadlineMs ?? this._config.drainTimeout;
-    const deadline = Date.now() + ms;
     // Cap timer cleared whichever side wins, so a fast drain leaves no
     // pending timer holding the host's event loop open.
     let cap: ReturnType<typeof setTimeout> | undefined;
-    const capped = new Promise<void>((resolve) => {
-      cap = setTimeout(resolve, ms);
-    });
     try {
-      await Promise.race([this._finalDrain(deadline), capped]);
+      await Promise.race([
+        this._finalDrain(Date.now() + ms),
+        new Promise<void>((resolve) => {
+          cap = setTimeout(resolve, ms);
+        }),
+      ]);
     } finally {
-      if (cap !== undefined) clearTimeout(cap);
+      clearTimeout(cap);
     }
   }
 
   // ── internal ──────────────────────────────────────────────────────────
 
-  /** File-private push: only the producer helpers below call this. */
-  _enqueue(env: BufferedMessage): void {
-    this._buffer.enqueue(env);
+  /** Stop the timer only. No drain — close() owns the final drain. */
+  private _stop(): void {
+    this._stopped = true;
+    if (this._timer !== undefined) {
+      clearTimeout(this._timer);
+      this._timer = undefined;
+    }
   }
 
   private _schedule(): void {
@@ -126,8 +126,7 @@ export class Worker {
   private async _runFlush(): Promise<void> {
     try {
       this._lastFlushAt = Date.now();
-      const batch = this._buffer.drain();
-      if (batch.length === 0) return;
+      const batch = this._buffer.flush();
 
       // A client serves one protocol, so the whole batch goes to one
       // endpoint, chunked at BATCH_CAP.
@@ -158,39 +157,32 @@ export class Worker {
 // ── Producer chokepoints (module-local, not exported) ────────────────────
 //
 // The one place messages are validated, capped, and redacted before the
-// queue. Callers go through `Worker.captureOCPI` / `captureOCPP`.
+// queue. Pure: they return the envelope to enqueue, or null to drop.
+// Callers go through `Worker.captureOCPI` / `captureOCPP`.
 
 /**
- * Validate, enforce the body cap, redact, enqueue. An oversize body on
- * either side drops the whole message — a half-body is broken JSON and
- * would defeat the credentials redactor. Invalid identity ⇒ dropped.
+ * Validate, enforce the body cap, redact. An oversize body on either side
+ * drops the whole message — a half-body is broken JSON and would defeat the
+ * credentials redactor. Invalid identity ⇒ dropped.
  */
-function processOCPI(
-  worker: Worker,
+function prepareOCPI(
   msg: OCPIMessage,
   redact: OCPIRedactor,
   maxCaptureBytes: number,
-): void {
-  if (!validateRoamingIdentity(msg.identity)) return;
-  if ((msg.http.requestBody?.length ?? 0) > maxCaptureBytes) return;
-  if ((msg.http.responseBody?.length ?? 0) > maxCaptureBytes) return;
-  worker._enqueue({
-    capturedAt: new Date().toISOString(),
-    message: redact(msg),
-  });
+): BufferedMessage | null {
+  if (!validateRoamingIdentity(msg.identity)) return null;
+  if ((msg.data.requestBody?.length ?? 0) > maxCaptureBytes) return null;
+  if ((msg.data.responseBody?.length ?? 0) > maxCaptureBytes) return null;
+  return { capturedAt: new Date().toISOString(), message: redact(msg) };
 }
 
-/** Validate, enforce the payload cap, redact, enqueue. */
-function processOCPP(
-  worker: Worker,
+/** Validate, enforce the payload cap, redact. */
+function prepareOCPP(
   msg: OCPPMessage,
   redact: OCPPRedactor,
   maxCaptureBytes: number,
-): void {
-  if (!validateChargerIdentity(msg.identity)) return;
-  if ((msg.payload?.length ?? 0) > maxCaptureBytes) return;
-  worker._enqueue({
-    capturedAt: new Date().toISOString(),
-    message: redact(msg),
-  });
+): BufferedMessage | null {
+  if (!validateChargerIdentity(msg.identity)) return null;
+  if ((msg.payload?.length ?? 0) > maxCaptureBytes) return null;
+  return { capturedAt: new Date().toISOString(), message: redact(msg) };
 }

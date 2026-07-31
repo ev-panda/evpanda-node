@@ -99,7 +99,7 @@ const makeOCPI = (i: number): OCPIMessageInput => {
       tenantId: "t1",
       tenantName: "Tenant One",
     },
-    http: {
+    data: {
       method: "POST",
       url: `/ocpi/2.2/cdrs/${i}`,
       statusCode: 200,

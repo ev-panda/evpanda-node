@@ -2,29 +2,33 @@
  * Adapter — OCPI outbound (host → partner), fetch / undici.
  *
  * Returns a drop-in replacement for `globalThis.fetch`. It resolves identity
- * (ambient ALS first, then the `resolve` callback), clones request and
- * response, and reads both bodies in the *background* — the caller gets the
- * response without waiting on capture. Bodies are capped at `maxCaptureBytes`.
+ * via the `resolve` callback, clones request and response, and reads both
+ * bodies in the *background* — the caller gets the response without waiting
+ * on capture. Bodies are capped at `maxCaptureBytes`.
  *
- * The wrapper never alters the request or response and never throws into the
- * caller; a `baseFetch` network error propagates unchanged, no capture.
+ * The wrapper never throws into the caller; a `baseFetch` network error
+ * propagates unchanged, no capture. The only change it makes to the request
+ * is removing the SDK's own `X-EVPanda-*` identity headers before dispatch,
+ * so they are never sent to the partner. The response is never altered.
  */
 
-import { readBridge } from "../../internal/bridge.js";
-import { safeResolve } from "./resolver.js";
+import {
+  IDENTITY_HEADER_NAMES,
+  headerResolver,
+  safeResolve,
+} from "./resolver.js";
 
 import type { Logger } from "../../config.js";
 import type { OCPIResolver, RoamingIdentity } from "../../identity.js";
 import type { OCPIClient } from "../client.js";
-import type { CapturedHttp } from "../../types.js";
+import type { HttpExchange } from "../../types.js";
 
 export interface OCPIFetchOptions {
   /**
-   * Identity resolver. Required as a fallback even when `propagateIdentity`
-   * is on — calls made outside an inbound request (cron jobs, app startup,
-   * tests) have no ambient identity for the wrapper to pick up.
+   * Identity resolver, invoked for every outbound request. Omitted ⇒ the
+   * shipped `X-EVPanda-*` header reader.
    */
-  resolve: OCPIResolver;
+  resolve?: OCPIResolver;
 }
 
 /**
@@ -35,18 +39,22 @@ export interface OCPIFetchOptions {
 export function fetch(
   sdk: OCPIClient,
   baseFetch: typeof globalThis.fetch,
-  opts: OCPIFetchOptions,
+  opts: OCPIFetchOptions = {},
 ): typeof globalThis.fetch {
-  const bridge = readBridge(sdk);
+  const bridge = sdk._internal;
   // Inert SDK: skip every code path that touches the request or response.
   if (!bridge) return baseFetch;
 
-  const { maxCaptureBytes, identityStore, logger } = bridge;
-  const { resolve } = opts;
+  const { maxCaptureBytes, logger } = bridge;
+  const { resolve = headerResolver } = opts;
 
   // The signature mirrors the platform's `fetch`; we keep it permissive so
   // both Node and DOM lib typings are accepted by callers.
   const wrapped: typeof globalThis.fetch = async (input, init) => {
+    // Re-checked per call: `close()` drops the channel, so a closed client
+    // reverts to the untouched fetch instead of capturing into a no-op engine.
+    if (!sdk._internal) return baseFetch(input, init);
+
     let request: Request;
     try {
       request = new Request(input, init);
@@ -56,14 +64,17 @@ export function fetch(
       return baseFetch(input, init);
     }
 
-    // Identity: ambient (ALS) first, resolver second.
+    // Snapshot before stripping: the resolver still sees the identity
+    // headers, the partner never does.
+    const requestHeaders = headersToRecord(request.headers);
+    for (const name of IDENTITY_HEADER_NAMES) request.headers.delete(name);
+
     let identity: RoamingIdentity | undefined;
     try {
-      identity = identityStore?.current();
-      identity ??= safeResolve(resolve, {
+      identity = safeResolve(resolve, {
         method: request.method,
         url: request.url,
-        headers: headersToRecord(request.headers),
+        requestHeaders,
       });
     } catch (err) {
       logger?.warn("@evpanda/sdk: OCPI fetch resolver failed", {
@@ -101,9 +112,9 @@ export function fetch(
 }
 
 /**
- * Read both bodies (capped), assemble `CapturedHttp`, hand off to the SDK.
- * Best-effort — any failure is swallowed; an oversize body on either side
- * drops the whole capture.
+ * Read both bodies (capped), assemble the `HttpExchange`, hand off to the
+ * SDK. Best-effort — any failure is swallowed; an oversize body on either
+ * side drops the whole capture.
  */
 async function captureInBackground(
   sdk: OCPIClient,
@@ -121,7 +132,7 @@ async function captureInBackground(
       readBodyCapped(respClone?.body ?? null, maxCaptureBytes),
     ]);
     if (req.overflowed || resp.overflowed) return; // drop entire capture
-    const http: CapturedHttp = {
+    const data: HttpExchange = {
       method: request.method,
       url: request.url,
       statusCode: response.status,
@@ -130,7 +141,7 @@ async function captureInBackground(
       requestBody: req.body,
       responseBody: resp.body,
     };
-    sdk.captureOutboundMessage({ identity, http });
+    sdk.captureOutboundMessage({ identity, data });
   } catch (err) {
     logger?.warn("@evpanda/sdk: OCPI fetch capture failed", {
       error: String(err),

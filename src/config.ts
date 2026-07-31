@@ -42,8 +42,6 @@ export interface BaseConfig {
 
 /** Configuration for an OCPI roaming gateway client. */
 export interface OCPIConfig extends BaseConfig {
-  /** Opt-in: share the inbound-resolved identity with outbound adapters via ALS. */
-  propagateIdentity?: boolean;
   /** Extra headers to capture on top of the default allowlist; can't disable defaults. */
   ocpiAllowedHeaders?: string[];
 }
@@ -69,7 +67,6 @@ interface ResolvedBase {
 
 export interface ResolvedOCPIConfig extends ResolvedBase {
   protocol: "ocpi";
-  propagateIdentity: boolean;
   ocpiAllowedHeaders: readonly string[];
 }
 
@@ -98,10 +95,12 @@ const ERR = "@evpanda/sdk config";
 /** Warn sink for the tunable-field resolvers; logs only when `debug: true`. */
 type Warn = (msg: string) => void;
 
-/** Build the warn sink — silent unless `debug` is on. */
-function makeWarn(config: BaseConfig): Warn {
-  const logger: Logger | undefined =
-    config.debug === true ? (config.logger ?? console) : undefined;
+/**
+ * Build the warn sink over an already-resolved logger — silent when that is
+ * undefined, which is the case unless `debug` is on. Taking the logger (not
+ * the raw config) keeps the "logger only when debug" rule in one place.
+ */
+function makeWarn(logger: Logger | undefined): Warn {
   return (msg) => {
     // A malformed customer logger must not fail config resolution.
     try {
@@ -110,15 +109,6 @@ function makeWarn(config: BaseConfig): Warn {
       /* ignore */
     }
   };
-}
-
-function requireNonEmptyString(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(
-      `${ERR}: \`${field}\` is required and must be a non-empty string`,
-    );
-  }
-  return value.trim();
 }
 
 /** undefined or invalid (non-integer / below min) ⇒ fallback (+ warn). */
@@ -138,7 +128,12 @@ function resolveInt(
 }
 
 const resolveEndpoint = (raw: unknown): string => {
-  const s = requireNonEmptyString(raw, "endpoint");
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(
+      `${ERR}: \`endpoint\` is required and must be a non-empty string`,
+    );
+  }
+  const s = raw.trim();
   let url: URL;
   try {
     url = new URL(s);
@@ -189,7 +184,7 @@ function resolveBase<P extends Protocol>(
   const logger: Logger | undefined = debug
     ? (config.logger ?? console)
     : undefined;
-  const warn = makeWarn(config);
+  const warn = makeWarn(logger);
   return {
     endpoint: resolveEndpoint(config.endpoint),
     apiKey: resolveApiKey(config.apiKey),
@@ -229,12 +224,12 @@ function resolveBase<P extends Protocol>(
 }
 
 export function resolveOCPIConfig(config: OCPIConfig): ResolvedOCPIConfig {
+  const base = resolveBase(config, "ocpi");
   return {
-    ...resolveBase(config, "ocpi"),
-    propagateIdentity: config.propagateIdentity === true,
+    ...base,
     ocpiAllowedHeaders: resolveOCPIAllowedHeaders(
       config.ocpiAllowedHeaders,
-      makeWarn(config),
+      makeWarn(base.logger),
     ),
   };
 }

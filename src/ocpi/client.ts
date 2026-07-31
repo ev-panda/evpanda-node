@@ -1,22 +1,31 @@
 /**
  * OCPIClient — passive OCPI traffic capture. Public surface: `start`,
  * `captureInboundMessage`, `captureOutboundMessage`, `flush`, `close`.
- * Adapters in `./adapters/` reach internal state via the bridge WeakMap.
+ * Adapters in `./adapters/` receive their capture settings from the client.
  */
 
 import { RingBuffer } from "../buffer.js";
 import { resolveOCPIConfig } from "../config.js";
-import { IdentityStore } from "../internal/als.js";
-import { attachBridge } from "../internal/bridge.js";
-import { BaseClient } from "../internal/client-base.js";
-import { makeOCPIRedactor } from "../internal/ocpi-redact.js";
+import { BaseClient } from "../client.js";
+import { makeOCPIRedactor } from "./redact.js";
 import { Transport } from "../transport.js";
 import { Worker } from "../worker.js";
 
-import type { OCPIConfig } from "../config.js";
-import type { SdkInternal } from "../internal/bridge.js";
-import type { OCPIRedactor } from "../internal/ocpi-redact.js";
+import type { Logger, OCPIConfig } from "../config.js";
+import type { OCPIRedactor } from "./redact.js";
 import type { OCPIDirection, OCPIMessage, OCPIMessageInput } from "../types.js";
+
+/**
+ * Package-private channel from a client to its adapters, carried on the
+ * client's `_internal` field. Marked `@internal` there and erased from the
+ * published typings by `stripInternal`, so it is not part of the public API.
+ */
+export interface SdkInternal {
+  /** Resolved per-body cap; adapters use it to bound streaming accumulation. */
+  readonly maxCaptureBytes: number;
+  /** Effective logger (set only when `debug: true`); adapters log faults here. */
+  readonly logger?: Logger;
+}
 
 interface Engine {
   captureMessage(msg: OCPIMessage): void;
@@ -41,7 +50,6 @@ class ActiveEngine implements Engine {
     this.#redact = makeOCPIRedactor(resolved.ocpiAllowedHeaders);
     this.bridge = {
       maxCaptureBytes: resolved.maxCaptureBytes,
-      identityStore: resolved.propagateIdentity ? new IdentityStore() : undefined,
       logger: resolved.logger,
     };
   }
@@ -81,8 +89,28 @@ class NoopEngine implements Engine {
  * a bad config never throws; it yields an inert no-op client.
  */
 export class OCPIClient extends BaseClient<Engine> {
-  private constructor(engine: Engine) {
+  /**
+   * @internal Adapter-only snapshot; `undefined` on an inert client — which is
+   * how adapters short-circuit to a pass-through — and cleared by `close` so a
+   * closed client stops doing capture work. Stripped from the published
+   * typings: not public API, and not to be read or written by consumers.
+   */
+  _internal?: SdkInternal;
+
+  private constructor(engine: Engine, internal?: SdkInternal) {
     super(engine, () => new NoopEngine());
+    this._internal = internal;
+  }
+
+  /**
+   * Go inert, then drain. Dropping the channel first means adapters wrapped
+   * around this client fall back to their zero-overhead pass-through instead
+   * of resolving identities and buffering bodies into a no-op engine.
+   * Idempotent; never throws.
+   */
+  override async close(deadlineMs?: number): Promise<void> {
+    this._internal = undefined;
+    await super.close(deadlineMs);
   }
 
   /** Build and start. Any fault yields an inert client; never throws to the host. */
@@ -90,11 +118,7 @@ export class OCPIClient extends BaseClient<Engine> {
     try {
       const engine = new ActiveEngine(config);
       engine.arm();
-      // Register the bridge so adapters can read it; inert clients have no
-      // entry and adapters short-circuit to a pass-through.
-      const client = new OCPIClient(engine);
-      attachBridge(client, engine.bridge);
-      return client;
+      return new OCPIClient(engine, engine.bridge);
     } catch {
       return new OCPIClient(new NoopEngine());
     }
