@@ -1,15 +1,17 @@
 {
+  // Typecheck-only. tsup owns the build — it emits the bundles, sourcemaps and
+  // .d.ts from tsup.config.ts, and ignores the emit options here. Type-level
+  // options (notably `stripInternal`) ARE read by its .d.ts step.
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2022"],
     "types": ["node"],
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "outDir": "dist",
-    "rootDir": "src",
+    "noEmit": true,
+    // Erases `@internal` members (e.g. OCPIClient#_internal) from the emitted
+    // .d.ts — the adapter channel must not appear in the public typings.
+    "stripInternal": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -20,6 +22,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src"],
-  "exclude": ["dist", "node_modules", "**/*.test.ts"]
+  "include": ["src"]
 }

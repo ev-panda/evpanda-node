@@ -21,7 +21,7 @@ export enum OCPPEventType {
   Message = 2,
 }
 
-export interface CapturedHttp {
+export interface HttpExchange {
   method: string;
   url: string;
   statusCode?: number;
@@ -35,7 +35,7 @@ export interface CapturedHttp {
 export interface OCPIMessage {
   direction: OCPIDirection;
   identity: RoamingIdentity;
-  http: CapturedHttp;
+  data: HttpExchange;
 }
 
 /**
@@ -43,7 +43,10 @@ export interface OCPIMessage {
  * `captureOutboundMessage`. `direction` is omitted — the chosen method
  * sets it.
  */
-export type OCPIMessageInput = Omit<OCPIMessage, "direction">;
+export interface OCPIMessageInput {
+  identity: RoamingIdentity;
+  data: HttpExchange;
+}
 
 export interface OCPPMessage {
   eventType: OCPPEventType;

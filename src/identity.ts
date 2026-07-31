@@ -31,8 +31,7 @@ export interface ChargerIdentity {
 export interface OCPIResolverCtx {
   method: string;
   url: string;
-  /** Normalized to lowercase keys, single-string values. */
-  headers: Record<string, string>;
+  requestHeaders: Record<string, string>;
 }
 
 /** Function the OCPI adapters accept: request context → roaming identity. */

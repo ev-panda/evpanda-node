@@ -20,8 +20,21 @@ them in batches to the EVPanda ingestion API.
 ## Install
 
 ```sh
-npm add @evpanda/sdk      # or: pnpm add @evpanda/sdk / bun add @evpanda/sdk
+npm add @evpanda/sdk
+# pnpm add @evpanda/sdk · yarn add @evpanda/sdk · bun add @evpanda/sdk
 ```
+
+**Optional — zstd compression.** `compression` defaults to `"zstd"`, which needs
+this optional peer. Without it the SDK silently falls back to gzip, so install it
+only if you want the smaller payloads:
+
+```sh
+npm add @mongodb-js/zstd
+```
+
+No load-order requirements — the SDK patches no globals, so import it wherever
+you like. `express` and `axios` need no install on our account: the adapters
+reference them as types only.
 
 ## Quick start — OCPI
 
@@ -32,27 +45,24 @@ import { OCPIClient, ocpi } from "@evpanda/sdk";
 const client = OCPIClient.start({
   endpoint: "https://ingest.evpanda.io",
   // apiKey omitted ⇒ read from EVPANDA_API_KEY
-  propagateIdentity: true,           // inbound identity flows to outbound (see below)
 });
 
 const app = express();
 app.use(express.json());             // the adapter captures the request body
                                      // from `req.body` — run a body parser first
 
-// Inbound capture. The resolver receives `{ method, url, headers }` and
-// returns a `RoamingIdentity`; throwing or returning an invalid identity
+// Inbound capture. The resolver receives `{ method, url, requestHeaders }`
+// and returns a `RoamingIdentity`; throwing or returning an invalid identity
 // drops the capture for that request — the request itself is never blocked.
 app.use(ocpi.express(client, {
-  resolve: ({ headers }) => ({
-    platformId: headers["x-platform-id"]!,
-    platformName: headers["x-platform-name"]!,
+  resolve: ({ requestHeaders }) => ({
+    platformId: requestHeaders["x-platform-id"]!,
+    platformName: requestHeaders["x-platform-name"]!,
   }),
 }));
 
 // Outbound capture. Drop-in for `globalThis.fetch`; use it for partner calls.
 const fetch = ocpi.fetch(client, globalThis.fetch, {
-  // Required even with `propagateIdentity: true` — used when there is no
-  // ambient inbound identity (cron jobs, startup, tests).
   resolve: () => ({ platformId: "acme", platformName: "Acme" }),
 });
 
@@ -63,8 +73,7 @@ const partner = ocpi.axios(client, axiosLib.create({ baseURL: "https://partner.e
 });
 
 app.post("/ocpi/2.2/cdrs", async (_req, res) => {
-  // Both calls are auto-captured. With `propagateIdentity: true` the outbound
-  // calls reuse the identity the inbound resolver returned — no rewiring.
+  // Both calls are auto-captured.
   await fetch("https://partner.example/ocpi/2.2/sessions", { method: "POST", body: "{}" });
   await partner.post("/ocpi/2.2/tokens", { id: "t1" });
   res.json({ ack: true });
@@ -75,6 +84,48 @@ process.on("SIGTERM", () => void client.close());
 
 The adapter sets the message **direction** itself — `ocpi.express` captures
 as `IN`, `ocpi.fetch` / `ocpi.axios` as `OUT`. You never pass it.
+
+### Skipping the resolver: `X-EVPanda-*` headers
+
+`resolve` is optional. Omit it and the adapter falls back to the shipped
+`ocpi.headerResolver`, which reads identity from these headers (case-insensitive):
+
+| Header | Field |
+|---|---|
+| `X-EVPanda-Platform-Id` | `platformId` (required) |
+| `X-EVPanda-Platform-Name` | `platformName` (required) |
+| `X-EVPanda-Tenant-Id` | `tenantId` (optional) |
+| `X-EVPanda-Tenant-Name` | `tenantName` (optional) |
+
+```ts
+const fetch = ocpi.fetch(client, globalThis.fetch);   // no resolver needed
+const partner = ocpi.axios(client, axiosLib.create({ baseURL: "…" }));
+app.use(ocpi.express(client));
+
+await fetch("https://partner.example/ocpi/2.2/sessions", {
+  method: "POST",
+  headers: {
+    "X-EVPanda-Platform-Id": "acme",
+    "X-EVPanda-Platform-Name": "Acme",
+  },
+  body: "{}",
+});
+```
+
+Rules: a request with no identity headers is simply **not captured** (no error,
+no partial record). Tenant is **all-or-nothing** — set both tenant headers or
+neither; a half-set pair fails validation and drops that message.
+
+Two things to know:
+
+- **Outbound**, the adapter **strips these headers before dispatch** — the
+  partner never receives them, so `tenantId` / `tenantName` stay internal.
+  They are also excluded from the captured record by the header allowlist.
+  (Stripping happens only while capture is active; an inert client — bad
+  config, or after `close()` — passes the request through untouched.)
+- **Inbound**, partners will not send these headers. `ocpi.express` with no
+  resolver only works if earlier middleware (auth, tenancy) stamps them onto
+  `req.headers` first — so mount that middleware **before** this one.
 
 ### Other Node frameworks
 
@@ -91,19 +142,19 @@ app.use(async (ctx, next) => {
   if (identity) {
     client.captureInboundMessage({
       identity,
-      http: { /* method, url, statusCode, headers, bodies */ },
+      data: { /* method, url, statusCode, headers, bodies */ },
     });
   }
 });
 
 // fastify — install on the `onResponse` lifecycle hook.
 fastify.addHook("onResponse", async (req, reply) => {
-  /* resolve identity + client.captureInboundMessage({ identity, http }) */
+  /* resolve identity + client.captureInboundMessage({ identity, data }) */
 });
 ```
 
 `captureInboundMessage` / `captureOutboundMessage` take an `OCPIMessageInput`
-(`{ identity, http }`) — the method name picks the direction, so there is no
+(`{ identity, data }`) — the method name picks the direction, so there is no
 `direction` field to set.
 
 ## Quick start — OCPP
@@ -169,14 +220,6 @@ platforms, tenants and chargers.
 - **OCPP** — `TO_CP` (host → charge point) or `FROM_CP` (charge point →
   host). Passed to `captureMessage`.
 
-### Identity propagation (OCPI, opt-in)
-
-With `propagateIdentity: true`, the inbound `ocpi.express` adapter puts the
-resolved identity into `AsyncLocalStorage` for the handler's duration, so
-`ocpi.fetch` / `ocpi.axios` calls inside that handler inherit it — resolve
-once, on the inbound side. Calls outside a request fall back to the outbound
-adapter's `resolve`. OCPP has no equivalent (identity is per-connection).
-
 ## Configuration
 
 Shared between `OCPIClient.start(config)` and `OCPPClient.start(config)`:
@@ -195,71 +238,11 @@ Shared between `OCPIClient.start(config)` and `OCPPClient.start(config)`:
 
 `OCPIClient`-only:
 
-| Option              | Default     | Description                                                                                                       |
-|---------------------|-------------|-------------------------------------------------------------------------------------------------------------------|
-| `propagateIdentity` | `false`     | Set to `true` to share inbound-resolved identity with outbound `ocpi.fetch` / `ocpi.axios` via AsyncLocalStorage. |
-| `ocpiAllowedHeaders`| `[]`        | Extra headers to capture, on top of the default OCPI allowlist. Cannot disable the defaults.                      |
+| Option              | Default     | Description                                                                                    |
+|---------------------|-------------|--------------------------------------------------------------------------------------------------|
+| `ocpiAllowedHeaders`| `[]`        | Extra headers to capture, on top of the default OCPI allowlist. Cannot disable the defaults.     |
 
 **Config errors never crash your boot.** `endpoint` and `apiKey` are
 hard-required — a bad value makes `start()` return an inert no-op client.
 Every other option is *tunable*: a bad value falls back to its default
 (e.g. `drainTimeout: 3000` → `10000`), logged when `debug: true`.
-
-## Public API surface
-
-```ts
-// OCPI
-OCPIClient.start(config): OCPIClient
-ocpiClient.captureInboundMessage(msg: OCPIMessageInput): void   // direction = IN
-ocpiClient.captureOutboundMessage(msg: OCPIMessageInput): void  // direction = OUT
-ocpiClient.flush(): Promise<void>
-ocpiClient.close(deadlineMs?: number): Promise<void>
-
-// OCPP
-OCPPClient.start(config): OCPPClient
-ocppClient.connection(identity: ChargerIdentity): OCPPSession   // recommended
-//   OCPPSession = { connectionId, message(data, direction), disconnect() }
-ocppClient.captureConnect({ identity, connectionId }): void     // flat primitives
-ocppClient.captureMessage({ identity, connectionId, data, direction }): void
-ocppClient.captureDisconnect({ identity, connectionId }): void
-ocppClient.flush(): Promise<void>
-ocppClient.close(deadlineMs?: number): Promise<void>
-
-// OCPI adapters — all three take a `resolve: (ctx) => RoamingIdentity`
-ocpi.express(client, { resolve }): (req, res, next) => void
-ocpi.fetch(client, baseFetch, { resolve }): typeof fetch
-ocpi.axios(client, instance, { resolve }): AxiosInstance
-```
-
-- **OCPI** capture takes an `OCPIMessageInput` (`{ identity, http }`); the
-  method name sets the direction. The adapters resolve identity per
-  request via the `resolve` function you supply.
-- **OCPP** capture takes a literal `ChargerIdentity` — no resolver, since
-  the charge point is known when the connection opens.
-
-The SDK validates every identity and silently drops a message it can't
-attribute; a swallowed adapter fault is logged when `debug: true`.
-
-## Behavior
-
-- **Batched delivery** — flushes when the buffer fills or every `flushInterval`.
-- **Backpressure = drop-oldest** — a slow/down upstream caps the buffer at
-  `bufferCapacity`; the app is never blocked.
-- **Body cap = drop, not truncate** — an OCPI body or OCPP frame over
-  `maxCaptureBytes` drops the *whole* message; a half-body is never shipped
-  (broken JSON, and it would defeat the redactor).
-- **Request bodies, safely** — `ocpi.express` reads `req.body` (whatever a
-  body parser populated), never tees the raw stream, so it can't disturb the
-  host's own parsing.
-- **Aborted requests captured** — `ocpi.express` records a request even when
-  the client disconnects before the response completes.
-- **OCPI redaction** — header allowlist (Authorization, Cookie, X-API-Key
-  never captured); the credentials-endpoint `token` is always masked.
-- **Resilient transport** — bounded retry with backoff on 5xx/network;
-  400/401/413 dropped without retry storms.
-- **Graceful shutdown** — `await client.close()` drains within `drainTimeout`,
-  then stops. Idempotent.
-- **Compression** — zstd via the optional `@mongodb-js/zstd` peer, gzip
-  fallback if it's absent; no hard runtime dependency.
-- **Adapter isolation** — the `ocpi.*` adapters never alter the request or
-  response, never throw, and no-op when the client is inert.

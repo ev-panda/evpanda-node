@@ -16,15 +16,15 @@ import { randomUUID } from "node:crypto";
 import { RingBuffer } from "../buffer.js";
 import { resolveOCPPConfig } from "../config.js";
 import { validateChargerIdentity } from "../identity.js";
-import { BaseClient } from "../internal/client-base.js";
-import { makeOCPPRedactor } from "../internal/ocpp-redact.js";
+import { BaseClient } from "../client.js";
+import { makeOCPPRedactor } from "./redact.js";
 import { Transport } from "../transport.js";
 import { Worker } from "../worker.js";
 import { OCPPEventType } from "../types.js";
 
 import type { OCPPConfig, Logger } from "../config.js";
 import type { ChargerIdentity } from "../identity.js";
-import type { OCPPRedactor } from "../internal/ocpp-redact.js";
+import type { OCPPRedactor } from "./redact.js";
 import type { OCPPDirection, OCPPMessage } from "../types.js";
 
 /**

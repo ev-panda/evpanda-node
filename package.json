@@ -1,6 +1,6 @@
 {
   "name": "@evpanda/sdk",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "EVPanda SDK — passive OCPI/OCPP traffic capture for embedding in customer OCPI servers and OCPP CSMS.",
   "keywords": [
     "ocpi",
@@ -59,7 +59,7 @@
     "test:watch": "vitest",
     "test:e2e": "npm run build && vitest run test/e2e.test.ts",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build"
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
