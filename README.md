@@ -1,6 +1,6 @@
 # @evpanda/sdk
 
-[![Build](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml)
+[![Build](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml/badge.svg)](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml)
 
 Passive OCPI / OCPP traffic capture for Node. Embed it in your OCPI server or
 OCPP CSMS; it records protocol messages, buffers them in-process, and ships
@@ -21,7 +21,12 @@ them in batches to the EVPanda ingestion API.
 
 ```sh
 npm add @evpanda/sdk
-# pnpm add @evpanda/sdk · yarn add @evpanda/sdk · bun add @evpanda/sdk
+
+pnpm add @evpanda/sdk
+
+yarn add @evpanda/sdk
+
+bun add @evpanda/sdk
 ```
 
 **Optional — zstd compression.** `compression` defaults to `"zstd"`, which needs
@@ -36,16 +41,70 @@ No load-order requirements — the SDK patches no globals, so import it wherever
 you like. `express` and `axios` need no install on our account: the adapters
 reference them as types only.
 
+## Identity Resolution
+
+Every captured message must carry an identity; the SDK validates it and
+silently drops messages it can't attribute (it never throws back at you).
+
+- **OCPI →** `RoamingIdentity`: `platformId` + `platformName` required.
+- **OCPP →** `ChargerIdentity`: `chargerId` required.
+- `tenantId` + `tenantName` are optional but **all-or-nothing** — supply
+  both or neither.
+
+Identity is per message, not global config — one process can serve many
+platforms, tenants and chargers.
+
+## Quick start — OCPP
+
+```ts
+import { WebSocketServer } from "ws";
+import { OCPPClient } from "@evpanda/sdk";
+
+const client = OCPPClient.start({
+  endpoint: "https://ingest.evpanda.io",
+});
+
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (socket, req) => {
+  // connection() mints the connectionId, records the connect, and returns
+  // a session handle. Keep it for the life of the socket.
+  const session = client.connection({ chargerId: extractChargerId(req.url ?? "") });
+
+  socket.on("message", (data) => session.message(data.toString(), "FROM_CP"));
+  socket.on("close", () => session.disconnect());
+});
+
+process.on("SIGTERM", () => void client.close());
+```
+
+`client.connection(identity)` is the recommended path — every WS server has a
+connection object to hang the returned `OCPPSession` on. The session owns the
+`connectionId` (fresh per connection) and carries the identity, so per-frame
+calls pass neither. It works the same for **uWebSockets.js**, **socket.io**,
+or any WS library.
+
+If you need finer control (a host whose inbound and outbound paths are
+separate, like a CSMS that sends via its own method), use the flat
+primitives the session is built on:
+
+```ts
+client.captureConnect({ identity, connectionId });
+client.captureMessage({ identity, connectionId, data, direction });   // both required
+client.captureDisconnect({ identity, connectionId });
+```
+
+`identity` is a `ChargerIdentity` literal — OCPP identity is known at connect
+time, so there is no resolver form.
+
 ## Quick start — OCPI
 
 ```ts
 import express from "express";
 import { OCPIClient, ocpi } from "@evpanda/sdk";
 
-const client = OCPIClient.start({
-  endpoint: "https://ingest.evpanda.io",
-  // apiKey omitted ⇒ read from EVPANDA_API_KEY
-});
+// Picks up EVPANDA_API_KEY from the env vars
+const client = OCPIClient.start();
 
 const app = express();
 app.use(express.json());             // the adapter captures the request body
@@ -157,68 +216,6 @@ fastify.addHook("onResponse", async (req, reply) => {
 (`{ identity, data }`) — the method name picks the direction, so there is no
 `direction` field to set.
 
-## Quick start — OCPP
-
-```ts
-import { WebSocketServer } from "ws";
-import { OCPPClient } from "@evpanda/sdk";
-
-const client = OCPPClient.start({
-  endpoint: "https://ingest.evpanda.io",
-});
-
-const wss = new WebSocketServer({ port: 8080 });
-
-wss.on("connection", (socket, req) => {
-  // connection() mints the connectionId, records the connect, and returns
-  // a session handle. Keep it for the life of the socket.
-  const session = client.connection({ chargerId: extractChargerId(req.url ?? "") });
-
-  socket.on("message", (data) => session.message(data.toString(), "FROM_CP"));
-  socket.on("close", () => session.disconnect());
-});
-
-process.on("SIGTERM", () => void client.close());
-```
-
-`client.connection(identity)` is the recommended path — every WS server has a
-connection object to hang the returned `OCPPSession` on. The session owns the
-`connectionId` (fresh per connection) and carries the identity, so per-frame
-calls pass neither. It works the same for **uWebSockets.js**, **socket.io**,
-or any WS library.
-
-If you need finer control (a host whose inbound and outbound paths are
-separate, like a CSMS that sends via its own method), use the flat
-primitives the session is built on:
-
-```ts
-client.captureConnect({ identity, connectionId });
-client.captureMessage({ identity, connectionId, data, direction });   // both required
-client.captureDisconnect({ identity, connectionId });
-```
-
-`identity` is a `ChargerIdentity` literal — OCPP identity is known at connect
-time, so there is no resolver form.
-
-## Identity
-
-Every captured message must carry an identity; the SDK validates it and
-silently drops messages it can't attribute (it never throws back at you).
-
-- **OCPI →** `RoamingIdentity`: `platformId` + `platformName` required.
-- **OCPP →** `ChargerIdentity`: `chargerId` required.
-- `tenantId` + `tenantName` are optional but **all-or-nothing** — supply
-  both or neither.
-
-Identity is per message, not global config — one process can serve many
-platforms, tenants and chargers.
-
-### Direction
-
-- **OCPI** — `IN` (partner → host) or `OUT` (host → partner). Set by the
-  capture method / adapter; you never pass it.
-- **OCPP** — `TO_CP` (host → charge point) or `FROM_CP` (charge point →
-  host). Passed to `captureMessage`.
 
 ## Configuration
 
