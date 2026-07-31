@@ -9,6 +9,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { OCPIClient } from "../dist/index.js";
 import type { OCPIMessageInput } from "../dist/index.js";
 
+/**
+ * Node 18 leaves idle keep-alive sockets open, so `server.close()` blocks for
+ * `keepAliveTimeout` (5s) after any undici/global-fetch request — long enough
+ * to blow a test's 5s budget. Node 19+ drops idle connections itself.
+ */
+function closeSockets(server: http.Server): void {
+  server.closeAllConnections?.();
+}
+
+
 // ── Mock upstream ────────────────────────────────────────────────────────
 
 interface Received {
@@ -65,7 +75,7 @@ const startMockUpstream = (): Promise<MockUpstream> => {
       const { port } = server.address() as AddressInfo;
       mock.url = `http://127.0.0.1:${port}`;
       mock.close = () =>
-        new Promise<void>((r) => server.close(() => r()));
+        new Promise<void>((r) => { server.close(() => r()); closeSockets(server); });
       resolve(mock);
     });
   });

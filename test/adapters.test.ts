@@ -20,6 +20,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { OCPIClient, OCPPClient, ocpi } from "../dist/index.js";
 import type { OCPIResolver } from "../dist/index.js";
 
+/**
+ * Node 18 leaves idle keep-alive sockets open, so `server.close()` blocks for
+ * `keepAliveTimeout` (5s) after any undici/global-fetch request — long enough
+ * to blow a test's 5s budget. Node 19+ drops idle connections itself.
+ */
+function closeSockets(server: http.Server): void {
+  server.closeAllConnections?.();
+}
+
+
 // ── Mock ingestion server (re-used pattern from e2e.test.ts) ─────────────
 
 interface Received {
@@ -72,7 +82,7 @@ async function startMockUpstream(): Promise<MockUpstream> {
       resolve({
         url: `http://127.0.0.1:${port}`,
         received,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+        close: () => new Promise<void>((r) => { server.close(() => r()); closeSockets(server); }),
       });
     });
   });
@@ -103,7 +113,7 @@ async function startMockPartner(): Promise<MockPartner> {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
       partner.url = `http://127.0.0.1:${port}`;
-      partner.close = () => new Promise<void>((r) => server.close(() => r()));
+      partner.close = () => new Promise<void>((r) => { server.close(() => r()); closeSockets(server); });
       resolve(partner);
     });
   });
@@ -145,7 +155,7 @@ async function listenOn(
       const { port } = server.address() as AddressInfo;
       resolve({
         url: `http://127.0.0.1:${port}`,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+        close: () => new Promise<void>((r) => { server.close(() => r()); closeSockets(server); }),
       });
     });
   });
