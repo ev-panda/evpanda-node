@@ -6,11 +6,6 @@ Passive OCPI / OCPP traffic capture for Node. Embed it in your OCPI server or
 OCPP CSMS; it records protocol messages, buffers them in-process, and ships
 them in batches to the EVPanda ingestion API.
 
-> **It never gets in your way.** The SDK will not block your request path,
-> throw into your handlers, crash your process, or grow memory unbounded. If
-> it's under stress or the network is down it drops data — it never degrades
-> your application.
-
 - Dual **ESM + CommonJS**, typed.
 - **Node ≥ 18.**
 - **Zero hard runtime dependencies** — zstd compression is an optional peer.
@@ -57,97 +52,136 @@ platforms, tenants and chargers.
 ## Quick start — OCPP
 
 ```ts
+import { randomUUID } from "node:crypto";
 import { WebSocketServer } from "ws";
 import { OCPPClient } from "@evpanda/sdk";
 
-const client = OCPPClient.start({
-  endpoint: "https://ingest.evpanda.io",
-});
+import type { IncomingMessage } from "node:http";
+import type { ChargerIdentity } from "@evpanda/sdk";
+
+// Picks up EVPANDA_API_KEY from the env vars
+const client = OCPPClient.start();
+
+/**
+ * Your own charge-point identification — whatever your CSMS already does at
+ * handshake time: parse the URL path, read Basic auth, check a client
+ * certificate, hit your DB. Return undefined for a charger you don't know.
+ */
+function resolveChargerIdentity(req: IncomingMessage): ChargerIdentity | undefined {
+  // Implement this as per your workflow. Identify chargerId from req
+  // Add tenantId + tenantName if you're multi-tenant
+  return { identity };   
+}
 
 const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (socket, req) => {
-  // connection() mints the connectionId, records the connect, and returns
-  // a session handle. Keep it for the life of the socket.
-  const session = client.connection({ chargerId: extractChargerId(req.url ?? "") });
+  const identity = resolveChargerIdentity(req);
+  if (!identity) {
+    socket.close(1008, "unknown charge point");   // your policy, not the SDK's
+    return;
+  }
 
-  socket.on("message", (data) => session.message(data.toString(), "FROM_CP"));
-  socket.on("close", () => session.disconnect());
+  // One id per socket, stable for its lifetime — it ties the connect, every
+  // frame, and the disconnect together into one session on the EVPanda side.
+  const connectionId = randomUUID();
+  client.captureConnect({ identity, connectionId });
+
+  // Outbound: capture whatever the CSMS sends back to the charge point.
+  const send = (frame: string): void => {
+    socket.send(frame);
+    client.captureMessage({ identity, connectionId, data: frame, direction: "TO_CP" });
+  };
+
+  socket.on("message", (raw) => {
+    const frame = raw.toString();
+    client.captureMessage({ identity, connectionId, data: frame, direction: "FROM_CP" });
+
+    send(handleFrame(frame));   // your CSMS logic → its CallResult
+  });
+
+  socket.on("close", () => {
+    client.captureDisconnect({ identity, connectionId });
+  });
 });
 
 process.on("SIGTERM", () => void client.close());
 ```
 
-`client.connection(identity)` is the recommended path — every WS server has a
-connection object to hang the returned `OCPPSession` on. The session owns the
-`connectionId` (fresh per connection) and carries the identity, so per-frame
-calls pass neither. It works the same for **uWebSockets.js**, **socket.io**,
-or any WS library.
+`direction` is from the charge point's perspective: **`FROM_CP`** for frames it
+sent you, **`TO_CP`** for frames you send it. `identity` is a `ChargerIdentity`
+literal — OCPP identity is known at connect time, so there is no resolver form.
 
-If you need finer control (a host whose inbound and outbound paths are
-separate, like a CSMS that sends via its own method), use the flat
-primitives the session is built on:
-
-```ts
-client.captureConnect({ identity, connectionId });
-client.captureMessage({ identity, connectionId, data, direction });   // both required
-client.captureDisconnect({ identity, connectionId });
-```
-
-`identity` is a `ChargerIdentity` literal — OCPP identity is known at connect
-time, so there is no resolver form.
 
 ## Quick start — OCPI
 
+OCPI traffic flows both ways between roaming partners, and the SDK records
+each direction separately:
+
+- **Inbound** — a partner called *your* OCPI server. You are the server, so
+  you capture the request they sent and the response you returned. Typically
+  an eMSP pushing a CDR or session update to your endpoints.
+- **Outbound** — *you* called a partner's OCPI server. You are the client, so
+  you capture the request you sent and the response they returned. Typically
+  you pulling their locations or posting a token authorization.
+
+In both cases `identity` is the **partner** on the other side of the
+exchange — never your own platform.
+
+One method per direction, and the **method name sets the direction** — there
+is no `direction` field to pass. Both take `{ identity, data }`, where `data`
+is the HTTP exchange you want recorded:
+
 ```ts
-import express from "express";
-import { OCPIClient, ocpi } from "@evpanda/sdk";
+import { OCPIClient } from "@evpanda/sdk";
 
 // Picks up EVPANDA_API_KEY from the env vars
 const client = OCPIClient.start();
 
-const app = express();
-app.use(express.json());             // the adapter captures the request body
-                                     // from `req.body` — run a body parser first
+const identity = { platformId: "acme", platformName: "Acme" };
 
-// Inbound capture. The resolver receives `{ method, url, requestHeaders }`
-// and returns a `RoamingIdentity`; throwing or returning an invalid identity
-// drops the capture for that request — the request itself is never blocked.
-app.use(ocpi.express(client, {
-  resolve: ({ requestHeaders }) => ({
-    platformId: requestHeaders["x-platform-id"]!,
-    platformName: requestHeaders["x-platform-name"]!,
-  }),
-}));
-
-// Outbound capture. Drop-in for `globalThis.fetch`; use it for partner calls.
-const fetch = ocpi.fetch(client, globalThis.fetch, {
-  resolve: () => ({ platformId: "acme", platformName: "Acme" }),
+// You received an OCPI request from a registered partner → Inbound
+client.captureInboundMessage({
+  identity,
+  data: {
+    method: "POST",
+    url: "/ocpi/2.2/cdrs",
+    statusCode: 201,
+    requestHeaders: { "content-type": "application/json" },
+    responseHeaders: { "content-type": "application/json" },
+    requestBody: Buffer.from(JSON.stringify({ id: "cdr-1" })),
+    responseBody: Buffer.from(JSON.stringify({ status_code: 1000 })),
+  },
 });
 
-// Or attach to axios:
-import axiosLib from "axios";
-const partner = ocpi.axios(client, axiosLib.create({ baseURL: "https://partner.example" }), {
-  resolve: () => ({ platformId: "acme", platformName: "Acme" }),
-});
-
-app.post("/ocpi/2.2/cdrs", async (_req, res) => {
-  // Both calls are auto-captured.
-  await fetch("https://partner.example/ocpi/2.2/sessions", { method: "POST", body: "{}" });
-  await partner.post("/ocpi/2.2/tokens", { id: "t1" });
-  res.json({ ack: true });
+// You sent an OCPI request to a registered partner → Outbound
+client.captureOutboundMessage({
+  identity,
+  data: {
+    method: "GET",
+    url: "https://partner.example/ocpi/2.2/locations",
+    statusCode: 200,
+    requestHeaders: { "content-type": "application/json" },
+    responseHeaders: { "content-type": "application/json" },
+    responseBody: Buffer.from(JSON.stringify({ status_code: 1000 })),
+  },
 });
 
 process.on("SIGTERM", () => void client.close());
 ```
 
-The adapter sets the message **direction** itself — `ocpi.express` captures
-as `IN`, `ocpi.fetch` / `ocpi.axios` as `OUT`. You never pass it.
+`requestHeaders` and `responseHeaders` are required — pass `{}` if you have
+none. `statusCode` and both bodies are optional. Bodies are raw bytes
+(`Uint8Array`), capped at `maxCaptureBytes`; an oversize body drops the whole
+message rather than storing a truncated one.
 
-### Skipping the resolver: `X-EVPanda-*` headers
+Both calls are non-blocking and never throw back at you.
 
-`resolve` is optional. Omit it and the adapter falls back to the shipped
-`ocpi.headerResolver`, which reads identity from these headers (case-insensitive):
+## OCPI adapters
+
+The adapters do the assembly above for you — collect the headers and bodies
+and call the right method. **Identity comes from request headers that you
+stamp** (case-insensitive):
 
 | Header | Field |
 |---|---|
@@ -156,51 +190,137 @@ as `IN`, `ocpi.fetch` / `ocpi.axios` as `OUT`. You never pass it.
 | `X-EVPanda-Tenant-Id` | `tenantId` (optional) |
 | `X-EVPanda-Tenant-Name` | `tenantName` (optional) |
 
-```ts
-const fetch = ocpi.fetch(client, globalThis.fetch);   // no resolver needed
-const partner = ocpi.axios(client, axiosLib.create({ baseURL: "…" }));
-app.use(ocpi.express(client));
+A request with no identity headers is simply **not captured** — no error, no
+partial record, and the request itself is never blocked. Tenant is
+**all-or-nothing**: set both tenant headers or neither, since a half-set pair
+fails validation and drops that message.
 
-await fetch("https://partner.example/ocpi/2.2/sessions", {
+**Outbound, the adapters strip these headers before dispatch**, so the partner
+never receives them and `tenantId` / `tenantName` stay internal. (Stripping
+happens only while capture is active; an inert client — bad config, or after
+`close()` — passes the request through untouched.)
+
+If you need identity from something other than headers, skip the adapters and
+call `captureInboundMessage` / `captureOutboundMessage` directly — they take
+the identity object, as shown above.
+
+### `ocpi.express` — inbound
+
+Connect-style `(req, res, next)` middleware, typed against `node:http`, so it
+needs no express dependency and works on **connect** too. It tees
+`res.write`/`res.end` for the response body and reads the request body from
+`req.body` — so **mount a body parser first**, or there is nothing to capture.
+
+Partners will not send `X-EVPanda-*` headers, so stamp them from whatever your
+auth layer already resolved, in middleware mounted **before** this one:
+
+```ts
+import express from "express";
+import { OCPIClient, ocpi } from "@evpanda/sdk";
+
+const client = OCPIClient.start();
+const app = express();
+
+app.use(express.json());   // populates req.body — must come first
+
+// Your auth / tenancy layer already knows who is calling — stamp it.
+app.use((req, _res, next) => {
+  const partner = lookupPartner(req.headers.authorization);
+  if (partner) {
+    req.headers["x-evpanda-platform-id"] = partner.platformId;
+    req.headers["x-evpanda-platform-name"] = partner.platformName;
+  }
+  next();
+});
+
+app.use(ocpi.express(client));
+```
+
+### `ocpi.fetch` — outbound
+
+Wraps a fetch implementation and returns a **new** one. `globalThis.fetch` is
+left untouched, so you must call the returned function for calls to be
+captured. Request and response are cloned and read in the background — your
+caller gets the response without waiting on capture.
+
+You have already looked the partner up to get its Token B, so identity is in
+hand — stamp it alongside the auth header:
+
+```ts
+const fetch = ocpi.fetch(client, globalThis.fetch);
+
+await fetch(`${partner.baseUrl}/ocpi/2.2/sessions`, {
   method: "POST",
+  headers: {
+    authorization: `Token ${partner.tokenB}`,
+    "content-type": "application/json",
+    "X-EVPanda-Platform-Id": partner.platformId,
+    "X-EVPanda-Platform-Name": partner.platformName,
+  },
+  body: JSON.stringify({ id: "s1" }),
+});
+```
+
+Because it is just a `fetch`, clients that accept one work too:
+
+```ts
+const api = ky.create({ fetch });        // ky
+const $api = ofetch.create({ fetch });   // ofetch
+```
+
+### `ocpi.axios` — outbound
+
+Installs a request/response interceptor pair on the **instance you pass**, and
+returns that same instance — so the original variable is instrumented too. The
+error interceptor captures non-2xx responses as well, since axios rejects on
+those.
+
+One partner per instance? Set the headers as instance defaults and every call
+carries them:
+
+```ts
+import axiosLib from "axios";
+
+const partner = ocpi.axios(client, axiosLib.create({
+  baseURL: "https://partner.example",
   headers: {
     "X-EVPanda-Platform-Id": "acme",
     "X-EVPanda-Platform-Name": "Acme",
   },
-  body: "{}",
+}));
+
+await partner.post("/ocpi/2.2/tokens", { id: "t1" });
+```
+
+Talking to many partners through one instance? Pass them per call instead:
+
+```ts
+await partner.post("/ocpi/2.2/tokens", { id: "t1" }, {
+  headers: {
+    "X-EVPanda-Platform-Id": p.platformId,
+    "X-EVPanda-Platform-Name": p.platformName,
+  },
 });
 ```
 
-Rules: a request with no identity headers is simply **not captured** (no error,
-no partial record). Tenant is **all-or-nothing** — set both tenant headers or
-neither; a half-set pair fails validation and drops that message.
-
-Two things to know:
-
-- **Outbound**, the adapter **strips these headers before dispatch** — the
-  partner never receives them, so `tenantId` / `tenantName` stay internal.
-  They are also excluded from the captured record by the header allowlist.
-  (Stripping happens only while capture is active; an inert client — bad
-  config, or after `close()` — passes the request through untouched.)
-- **Inbound**, partners will not send these headers. `ocpi.express` with no
-  resolver only works if earlier middleware (auth, tenancy) stamps them onto
-  `req.headers` first — so mount that middleware **before** this one.
+Axios in Node goes through `node:http`, never `fetch` — so wrapping fetch
+captures nothing from axios. Use this adapter if your outbound calls use it.
 
 ### Other Node frameworks
 
 `ocpi.express` is connect-style `(req, res, next)`; it works on **express**
 and **connect** directly. For koa / hono / fastify, drop the adapter and call
-`captureInboundMessage` / `captureOutboundMessage` yourself — your resolver
-logic stays the same:
+`captureInboundMessage` / `captureOutboundMessage` yourself. No headers are
+involved on this path — you hand the identity over directly:
 
 ```ts
-// koa / hono — resolve identity, then ship the message after the handler.
+// koa / hono — build the identity, then ship the message after the handler.
 app.use(async (ctx, next) => {
-  const identity = myResolver({ method: ctx.method, url: ctx.url, headers: ctx.headers });
+  const partner = lookupPartner(ctx.headers.authorization);
   await next();
-  if (identity) {
+  if (partner) {
     client.captureInboundMessage({
-      identity,
+      identity: { platformId: partner.platformId, platformName: partner.platformName },
       data: { /* method, url, statusCode, headers, bodies */ },
     });
   }
@@ -208,13 +328,12 @@ app.use(async (ctx, next) => {
 
 // fastify — install on the `onResponse` lifecycle hook.
 fastify.addHook("onResponse", async (req, reply) => {
-  /* resolve identity + client.captureInboundMessage({ identity, data }) */
+  /* build identity + client.captureInboundMessage({ identity, data }) */
 });
 ```
 
-`captureInboundMessage` / `captureOutboundMessage` take an `OCPIMessageInput`
-(`{ identity, data }`) — the method name picks the direction, so there is no
-`direction` field to set.
+Both take an `OCPIMessageInput` (`{ identity, data }`) — the method name picks
+the direction, so there is no `direction` field to set.
 
 
 ## Configuration
