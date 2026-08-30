@@ -319,6 +319,8 @@ a request path.
 
 ## Documentation
 
+- [Architecture and design notes](https://claude.ai/code/artifact/f214c278-cafd-409e-b1ab-b6a7fb8e7ece)
+  — how it works, and why. The source lives at [`docs/design.html`](docs/design.html)
 - [evpanda-go](https://github.com/evpanda-labs/evpanda-go) — the reference
   implementation this SDK tracks
 - [evpanda-py](https://github.com/evpanda-labs/evpanda-py) — the Python SDK,
