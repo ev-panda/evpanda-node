@@ -1,364 +1,325 @@
-# @evpanda/sdk
+# evpanda-node
 
-[![Build](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml/badge.svg)](https://github.com/ev-panda/evpanda-node/actions/workflows/build.yml)
+[![Build](https://github.com/evpanda-labs/evpanda-node/actions/workflows/build.yml/badge.svg)](https://github.com/evpanda-labs/evpanda-node/actions/workflows/build.yml)
+[![npm](https://img.shields.io/npm/v/@evpanda/sdk.svg)](https://www.npmjs.com/package/@evpanda/sdk)
 
 Passive OCPI / OCPP traffic capture for Node. Embed it in your OCPI server or
-OCPP CSMS; it records protocol messages, buffers them in-process, and ships
+OCPP CSMS and it records protocol messages, buffers them in memory, and ships
 them in batches to the EVPanda ingestion API.
 
-- Dual **ESM + CommonJS**, typed.
-- **Node ≥ 18.**
-- **Zero hard runtime dependencies** — zstd compression is an optional peer.
-- Separate `OCPIClient` and `OCPPClient` — pick the one your service speaks.
-- Drop-in adapters for express, fetch, axios; a session handle for OCPP.
+- **Non-blocking.** Capture calls never wait on the network and never throw
+  into your process.
+- **Bounded.** Undelivered captures are capped by a byte budget you set; under
+  pressure the SDK drops its own data rather than yours.
+- **Safe by default.** Secrets are stripped before anything is buffered.
+- **Small.** No runtime dependencies, one timer per client.
 
-## Install
+## Requirements
 
-```sh
-npm add @evpanda/sdk
+Node 22.15 or later. That is where `node:zlib` gained zstd, which is the codec
+every EVPanda SDK ships batches with — and why this package needs no
+dependencies at all. Node 18 and 20 are both past end-of-life.
 
-pnpm add @evpanda/sdk
-
-yarn add @evpanda/sdk
-
-bun add @evpanda/sdk
-```
-
-**Optional — zstd compression.** `compression` defaults to `"zstd"`, which needs
-this optional peer. Without it the SDK silently falls back to gzip, so install it
-only if you want the smaller payloads:
+## Installation
 
 ```sh
-npm add @mongodb-js/zstd
+npm install @evpanda/sdk
 ```
 
-No load-order requirements — the SDK patches no globals, so import it wherever
-you like. `express` and `axios` need no install on our account: the adapters
-reference them as types only.
+`express`, `axios` and `ws` are optional peers, needed only if you use the
+adapter built for them.
 
-## Identity Resolution
+## Quick start
 
-Every captured message must carry an identity; the SDK validates it and
-silently drops messages it can't attribute (it never throws back at you).
+Pick the client for the protocol your service speaks. `startOCPI` and
+`startOCPP` always return a usable client — if the config is bad you get an
+inert one carrying the reason on `.error`, so a typo can't stop your service
+from booting.
 
-- **OCPI →** `RoamingIdentity`: `platformId` + `platformName` required.
-- **OCPP →** `ChargerIdentity`: `chargerId` required.
-- `tenantId` + `tenantName` are optional but **all-or-nothing** — supply
-  both or neither.
+**The only thing you must supply is an API key.** Set `EVPANDA_API_KEY` in the
+environment, or pass `apiKey` in the config. `endpoint` defaults to the
+production ingestion API, so leave it unset unless you're pointing at another
+environment.
 
-Identity is per message, not global config — one process can serve many
-platforms, tenants and chargers.
+### OCPP
 
-## Quick start — OCPP
+`connection()` returns a session handle that mints the connection ID and
+carries the charger identity, so per-frame calls need neither.
 
 ```ts
-import { randomUUID } from "node:crypto";
-import { WebSocketServer } from "ws";
-import { OCPPClient } from "@evpanda/sdk";
+import { startOCPP } from "@evpanda/sdk";
 
-import type { IncomingMessage } from "node:http";
-import type { ChargerIdentity } from "@evpanda/sdk";
-
-// Picks up EVPANDA_API_KEY from the env vars
-const client = OCPPClient.start();
-
-/**
- * Your own charge-point identification — whatever your CSMS already does at
- * handshake time: parse the URL path, read Basic auth, check a client
- * certificate, hit your DB. Return undefined for a charger you don't know.
- */
-function resolveChargerIdentity(req: IncomingMessage): ChargerIdentity | undefined {
-  // Implement this as per your workflow. Identify chargerId from req
-  // Add tenantId + tenantName if you're multi-tenant
-  return { identity };   
-}
-
-const wss = new WebSocketServer({ port: 8080 });
+// endpoint defaults to production; apiKey comes from EVPANDA_API_KEY
+const panda = startOCPP();
+if (panda.error) log.warn(`${panda.error.message} (running inert)`);
 
 wss.on("connection", (socket, req) => {
-  const identity = resolveChargerIdentity(req);
-  if (!identity) {
-    socket.close(1008, "unknown charge point");   // your policy, not the SDK's
-    return;
-  }
+  const charger = resolveCharger(req); // however your CSMS does it
+  if (!charger) return socket.close(1008);
 
-  // One id per socket, stable for its lifetime — it ties the connect, every
-  // frame, and the disconnect together into one session on the EVPanda side.
-  const connectionId = randomUUID();
-  client.captureConnect({ identity, connectionId });
+  const session = panda.connection(charger); // records the connect
 
-  // Outbound: capture whatever the CSMS sends back to the charge point.
-  const send = (frame: string): void => {
-    socket.send(frame);
-    client.captureMessage({ identity, connectionId, data: frame, direction: "TO_CP" });
-  };
+  socket.on("message", (frame) => {
+    session.message(frame.toString(), "FROM_CP");
 
-  socket.on("message", (raw) => {
-    const frame = raw.toString();
-    client.captureMessage({ identity, connectionId, data: frame, direction: "FROM_CP" });
-
-    send(handleFrame(frame));   // your CSMS logic → its CallResult
+    const reply = handleFrame(frame); // your CSMS logic
+    socket.send(reply);
+    session.message(reply, "TO_CP");
   });
 
-  socket.on("close", () => {
-    client.captureDisconnect({ identity, connectionId });
-  });
+  socket.on("close", () => session.disconnect()); // records the close
 });
-
-process.on("SIGTERM", () => void client.close());
 ```
 
-`direction` is from the charge point's perspective: **`FROM_CP`** for frames it
-sent you, **`TO_CP`** for frames you send it. `identity` is a `ChargerIdentity`
-literal — OCPP identity is known at connect time, so there is no resolver form.
+`direction` is from the charge point's perspective: `"FROM_CP"` for frames it
+sent you, `"TO_CP"` for frames you send it. Use one session per socket — its
+connection ID ties the connect, every frame and the disconnect into a single
+session, and a reconnect gets a fresh one.
 
+`captureConnect` / `captureMessage` / `captureDisconnect` are the flat
+primitives underneath, for cases a session handle doesn't fit.
 
-## Quick start — OCPI
+### OCPI
 
-OCPI traffic flows both ways between roaming partners, and the SDK records
-each direction separately:
+Two methods, one per direction. The method name sets the direction — there's no
+field to get backwards.
 
-- **Inbound** — a partner called *your* OCPI server. You are the server, so
-  you capture the request they sent and the response you returned. Typically
-  an eMSP pushing a CDR or session update to your endpoints.
-- **Outbound** — *you* called a partner's OCPI server. You are the client, so
-  you capture the request you sent and the response they returned. Typically
-  you pulling their locations or posting a token authorization.
+| Method | You are the… | Typical case |
+|---|---|---|
+| `captureInboundMessage` | server | A partner pushes a CDR to your endpoint |
+| `captureOutboundMessage` | client | You pull a partner's locations |
 
-In both cases `identity` is the **partner** on the other side of the
-exchange — never your own platform.
-
-One method per direction, and the **method name sets the direction** — there
-is no `direction` field to pass. Both take `{ identity, data }`, where `data`
-is the HTTP exchange you want recorded:
+`identity` is always the **partner on the other side** — never your own
+platform.
 
 ```ts
-import { OCPIClient } from "@evpanda/sdk";
+import { startOCPI } from "@evpanda/sdk";
 
-// Picks up EVPANDA_API_KEY from the env vars
-const client = OCPIClient.start();
+const panda = startOCPI();
+if (panda.error) log.warn(`${panda.error.message} (running inert)`);
 
-const identity = { platformId: "acme", platformName: "Acme" };
-
-// You received an OCPI request from a registered partner → Inbound
-client.captureInboundMessage({
-  identity,
+panda.captureInboundMessage({
+  identity: { id: "acme", name: "Acme Mobility" },
   data: {
     method: "POST",
     url: "/ocpi/2.2/cdrs",
     statusCode: 201,
     requestHeaders: { "content-type": "application/json" },
     responseHeaders: { "content-type": "application/json" },
-    requestBody: Buffer.from(JSON.stringify({ id: "cdr-1" })),
-    responseBody: Buffer.from(JSON.stringify({ status_code: 1000 })),
+    requestBody,   // Uint8Array or string
+    responseBody,
   },
 });
-
-// You sent an OCPI request to a registered partner → Outbound
-client.captureOutboundMessage({
-  identity,
-  data: {
-    method: "GET",
-    url: "https://partner.example/ocpi/2.2/locations",
-    statusCode: 200,
-    requestHeaders: { "content-type": "application/json" },
-    responseHeaders: { "content-type": "application/json" },
-    responseBody: Buffer.from(JSON.stringify({ status_code: 1000 })),
-  },
-});
-
-process.on("SIGTERM", () => void client.close());
 ```
 
-`requestHeaders` and `responseHeaders` are required — pass `{}` if you have
-none. `statusCode` and both bodies are optional. Bodies are raw bytes
-(`Uint8Array`), capped at `maxCaptureBytes`; an oversize body drops the whole
-message rather than storing a truncated one.
+`statusCode` and both bodies are optional; the header records may be left out.
+Bodies are copied at capture, so you can reuse your own buffer the moment the
+call returns.
 
-Both calls are non-blocking and never throw back at you.
+## HTTP adapters
 
-## OCPI adapters
+`ocpi` wraps the HTTP layers your service already speaks, so you don't have to
+assemble exchanges yourself.
 
-The adapters do the assembly above for you — collect the headers and bodies
-and call the right method. **Identity comes from request headers that you
-stamp** (case-insensitive):
-
-| Header | Field |
-|---|---|
-| `X-EVPanda-Platform-Id` | `platformId` (required) |
-| `X-EVPanda-Platform-Name` | `platformName` (required) |
-| `X-EVPanda-Tenant-Id` | `tenantId` (optional) |
-| `X-EVPanda-Tenant-Name` | `tenantName` (optional) |
-
-A request with no identity headers is simply **not captured** — no error, no
-partial record, and the request itself is never blocked. Tenant is
-**all-or-nothing**: set both tenant headers or neither, since a half-set pair
-fails validation and drops that message.
-
-**Outbound, the adapters strip these headers before dispatch**, so the partner
-never receives them and `tenantId` / `tenantName` stay internal. (Stripping
-happens only while capture is active; an inert client — bad config, or after
-`close()` — passes the request through untouched.)
-
-If you need identity from something other than headers, skip the adapters and
-call `captureInboundMessage` / `captureOutboundMessage` directly — they take
-the identity object, as shown above.
-
-### `ocpi.express` — inbound
-
-Connect-style `(req, res, next)` middleware, typed against `node:http`, so it
-needs no express dependency and works on **connect** too. It tees
-`res.write`/`res.end` for the response body and reads the request body from
-`req.body` — so **mount a body parser first**, or there is nothing to capture.
-
-Partners will not send `X-EVPanda-*` headers, so stamp them from whatever your
-auth layer already resolved, in middleware mounted **before** this one:
+| Adapter | Direction | For |
+|---|---|---|
+| `ocpi.express(client)` | inbound | express, connect, or a bare `node:http` server |
+| `ocpi.fetch(client, fetch)` | outbound | global `fetch`, or any implementation you pass |
+| `ocpi.axios(client, instance)` | outbound | an axios instance |
 
 ```ts
-import express from "express";
-import { OCPIClient, ocpi } from "@evpanda/sdk";
+import { ocpi, startOCPI } from "@evpanda/sdk";
 
-const client = OCPIClient.start();
-const app = express();
+const panda = startOCPI();
 
-app.use(express.json());   // populates req.body — must come first
+app.use(ocpi.express(panda));                        // inbound
+const fetch = ocpi.fetch(panda, globalThis.fetch);   // outbound
+const http = ocpi.axios(panda, axios.create());      // outbound
+```
 
-// Your auth / tenancy layer already knows who is calling — stamp it.
-app.use((req, _res, next) => {
+A request with no resolvable identity is served exactly as it would have
+been — it just isn't captured.
+
+### Telling the adapters who the partner is
+
+Stamp the identity wherever you already look the partner up. Inbound, that is
+the request object:
+
+```ts
+import { ocpi } from "@evpanda/sdk";
+
+app.use((req, res, next) => {
   const partner = lookupPartner(req.headers.authorization);
-  if (partner) {
-    req.headers["x-evpanda-platform-id"] = partner.platformId;
-    req.headers["x-evpanda-platform-name"] = partner.platformName;
-  }
+  if (!partner) return res.status(401).json({ status_code: 2001 });
+  ocpi.setIdentity(req, { id: partner.id, name: partner.name });
   next();
 });
-
-app.use(ocpi.express(client));
 ```
 
-### `ocpi.fetch` — outbound
+The request is read when the response finishes, so **mount order doesn't
+matter**: your auth layer can sit inside or outside the capture middleware and
+either way the identity is seen.
 
-Wraps a fetch implementation and returns a **new** one. `globalThis.fetch` is
-left untouched, so you must call the returned function for calls to be
-captured. Request and response are cloned and read in the background — your
-caller gets the response without waiting on capture.
-
-You have already looked the partner up to get its Token B, so identity is in
-hand — stamp it alongside the auth header:
+Outbound, scope the call — you have already looked the partner up to get their
+token:
 
 ```ts
-const fetch = ocpi.fetch(client, globalThis.fetch);
-
-await fetch(`${partner.baseUrl}/ocpi/2.2/sessions`, {
-  method: "POST",
-  headers: {
-    authorization: `Token ${partner.tokenB}`,
-    "content-type": "application/json",
-    "X-EVPanda-Platform-Id": partner.platformId,
-    "X-EVPanda-Platform-Name": partner.platformName,
-  },
-  body: JSON.stringify({ id: "s1" }),
-});
+const response = await ocpi.useIdentity({ id: partner.id, name: partner.name }, () =>
+  fetch(`${partner.url}/ocpi/2.2/sessions`, {
+    method: "POST",
+    headers: { authorization: `Token ${partner.tokenB}` },
+    body: JSON.stringify(payload),
+  }),
+);
 ```
 
-Because it is just a `fetch`, clients that accept one work too:
+It is an `AsyncLocalStorage` underneath, so it follows the async call chain
+rather than leaking to whatever else the event loop is running.
+
+Failing both, all three adapters read the `X-EVPanda-Platform-Id` /
+`X-EVPanda-Platform-Name` headers (plus optional `-Tenant-Id` / `-Tenant-Name`).
+The outbound adapters strip them before dispatch, so partners never see them.
+
+If identity lives somewhere else entirely — a client certificate, a path prefix
+— pass your own resolver:
 
 ```ts
-const api = ky.create({ fetch });        // ky
-const $api = ofetch.create({ fetch });   // ofetch
+const byPath: ocpi.OCPIResolver = (info) => {
+  if (!info.url.startsWith("/partners/")) return undefined; // not captured
+  const name = info.url.split("/")[2];
+  return { id: name, name };
+};
+
+app.use(ocpi.express(panda, { resolve: byPath }));
 ```
 
-### `ocpi.axios` — outbound
+## Identity
 
-Installs a request/response interceptor pair on the **instance you pass**, and
-returns that same instance — so the original variable is instrumented too. The
-error interceptor captures non-2xx responses as well, since axios rejects on
-those.
+Every message carries its own identity; messages the SDK can't attribute are
+dropped rather than shipped as orphans.
 
-One partner per instance? Set the headers as instance defaults and every call
-carries them:
+| Protocol | Type | Required fields |
+|---|---|---|
+| OCPI | `Platform` | `id`, `name` |
+| OCPP | `Charger` | `id` |
 
-```ts
-import axiosLib from "axios";
-
-const partner = ocpi.axios(client, axiosLib.create({
-  baseURL: "https://partner.example",
-  headers: {
-    "X-EVPanda-Platform-Id": "acme",
-    "X-EVPanda-Platform-Name": "Acme",
-  },
-}));
-
-await partner.post("/ocpi/2.2/tokens", { id: "t1" });
-```
-
-Talking to many partners through one instance? Pass them per call instead:
-
-```ts
-await partner.post("/ocpi/2.2/tokens", { id: "t1" }, {
-  headers: {
-    "X-EVPanda-Platform-Id": p.platformId,
-    "X-EVPanda-Platform-Name": p.platformName,
-  },
-});
-```
-
-Axios in Node goes through `node:http`, never `fetch` — so wrapping fetch
-captures nothing from axios. Use this adapter if your outbound calls use it.
-
-### Other Node frameworks
-
-`ocpi.express` is connect-style `(req, res, next)`; it works on **express**
-and **connect** directly. For koa / hono / fastify, drop the adapter and call
-`captureInboundMessage` / `captureOutboundMessage` yourself. No headers are
-involved on this path — you hand the identity over directly:
-
-```ts
-// koa / hono — build the identity, then ship the message after the handler.
-app.use(async (ctx, next) => {
-  const partner = lookupPartner(ctx.headers.authorization);
-  await next();
-  if (partner) {
-    client.captureInboundMessage({
-      identity: { platformId: partner.platformId, platformName: partner.platformName },
-      data: { /* method, url, statusCode, headers, bodies */ },
-    });
-  }
-});
-
-// fastify — install on the `onResponse` lifecycle hook.
-fastify.addHook("onResponse", async (req, reply) => {
-  /* build identity + client.captureInboundMessage({ identity, data }) */
-});
-```
-
-Both take an `OCPIMessageInput` (`{ identity, data }`) — the method name picks
-the direction, so there is no `direction` field to set.
-
+`tenantId` and `tenantName` are optional but **all-or-nothing** — set both or
+neither. They keep their prefix because they describe a different subject:
+which of *your* tenants an exchange belongs to, not a property of the partner
+or the charger.
 
 ## Configuration
 
-Shared between `OCPIClient.start(config)` and `OCPPClient.start(config)`:
+`apiKey` is the only required field; it falls back to `$EVPANDA_API_KEY`.
+Everything else takes its default when omitted, and an out-of-range value falls
+back to that default with a warning rather than failing.
 
-| Option            | Default     | Description                                                        |
-|-------------------|-------------|--------------------------------------------------------------------|
-| `endpoint`        | —           | Ingestion API base URL (`https://…`). **Required.**                |
-| `apiKey`          | env         | Sent as `X-API-Key`; falls back to the `EVPANDA_API_KEY` env var.  |
-| `bufferCapacity`  | `10000`     | Max buffered messages. Oldest are dropped when full.               |
-| `maxCaptureBytes` | `65536`     | Per-body / per-frame capture cap (bytes).                          |
-| `flushInterval`   | `5000`      | Max ms between flushes (also flushes early when the buffer fills). |
-| `drainTimeout`    | `10000`     | Max ms `close()` waits to drain remaining messages.                |
-| `compression`     | `"zstd"`    | `"zstd"` or `"gzip"`.                                              |
-| `debug`           | `false`     | Master log switch. Silent unless `true`.                           |
-| `logger`          | `console`   | Optional logger; only used when `debug` is `true`.                 |
+A missing key and a malformed `endpoint` are the only things `start*` reports,
+and both are matchable — useful because a missing key is usually a deployment
+problem while a bad endpoint is a code one:
 
-`OCPIClient`-only:
+```ts
+import { ApiKeyError, startOCPI } from "@evpanda/sdk";
 
-| Option              | Default     | Description                                                                                    |
-|---------------------|-------------|--------------------------------------------------------------------------------------------------|
-| `ocpiAllowedHeaders`| `[]`        | Extra headers to capture, on top of the default OCPI allowlist. Cannot disable the defaults.     |
+const panda = startOCPI(config);
+if (panda.error instanceof ApiKeyError) {
+  throw new Error("EVPANDA_API_KEY is not set in this environment");
+}
+if (panda.error) log.warn(`${panda.error.message} (running inert)`);
+```
 
-**Config errors never crash your boot.** `endpoint` and `apiKey` are
-hard-required — a bad value makes `start()` return an inert no-op client.
-Every other option is *tunable*: a bad value falls back to its default
-(e.g. `drainTimeout: 3000` → `10000`), logged when `debug: true`.
+| Field | Default | Description |
+|---|---|---|
+| `endpoint` | `https://ingest.evpanda.io` | Ingestion API base URL. Set only to reach another environment |
+| `apiKey` | `$EVPANDA_API_KEY` | Sent as `X-API-Key`. **Required** |
+| `maxBufferBytes` | `32 MiB` | Memory ceiling for undelivered captures; oldest are evicted past it |
+| `maxCaptureBytes` | `65536` | Per body / per frame cap; an oversize body drops the whole message. Also bounds what the adapters hold per in-flight request |
+| `flushInterval` | `5000` | Maximum milliseconds between deliveries |
+| `drainTimeout` | `10000` | How long `close()` waits to drain, in ms (minimum `5000`) |
+| `logMode` | `"errors"` | `"silent"`, `"errors"`, `"debug"` |
+| `logger` | `console` | Where the SDK's own logs go |
+| `ocpiAllowedHeaders` | `[]` | *(OCPI only)* Extra headers to capture, on top of the defaults |
+
+## Memory
+
+`maxBufferBytes` caps everything waiting to be delivered — that is the number
+to provision against, and the SDK evicts rather than exceed it.
+
+The HTTP adapters add a second, smaller cost: while a request is in flight they
+hold a copy of its bodies, bounded per request by `maxCaptureBytes` and released
+as soon as the exchange is captured. That cost scales with concurrency rather
+than with the buffer, and with the bodies that actually pass rather than with
+the cap. Calling `captureInboundMessage` yourself instead of using an adapter
+avoids it, since you already hold the bytes.
+
+It is deliberately not bounded in aggregate. Doing that would mean making a
+request wait on a capture budget, and capture never blocks the host.
+
+## Logging
+
+The SDK reports problems to your logger by default, at a bounded rate: at most
+one summary line per minute, and nothing at all while it's healthy.
+
+```
+@evpanda/sdk: captures dropped window=60s captured=12 droppedInvalid=148302 buffered=0 bufferBytes=0
+```
+
+Set `logMode` to change that, or `EVPANDA_LOG=silent|errors|debug` to change it
+without touching code:
+
+| Mode | Output |
+|---|---|
+| `"silent"` | Nothing. Counters still work. |
+| `"errors"` | Default. Config problems at startup, plus the per-minute summary. |
+| `"debug"` | Adds per-batch delivery failures and a summary on close. |
+
+## Is it working?
+
+`stats()` is a snapshot of the client's delivery counters, always available and
+safe on an inert or closed client. Each counter maps to one root cause:
+
+```ts
+const stats = panda.stats();
+// { captured: 40120, droppedInvalid: 0, droppedOversize: 0, droppedEvicted: 9402,
+//   droppedUndeliverable: 0, droppedFault: 0, bufferedMessages: 2, bufferBytes: 528 }
+```
+
+| Counter | What a high value means |
+|---|---|
+| `captured` is 0 | The capture path is not wired in |
+| `droppedInvalid` | Identity resolution is failing |
+| `droppedOversize` | Bodies exceed `maxCaptureBytes` |
+| `droppedEvicted` | Upstream can't keep up, or the buffer is undersized |
+| `droppedUndeliverable` | Network, API key, or ingestion fault |
+| `droppedFault` | A bug in the SDK — please report it |
+
+It is a pull-based snapshot, so it feeds Prometheus, OpenTelemetry or a log line
+without the SDK depending on any of them.
+
+## Shutdown
+
+```ts
+await server.close();               // stop accepting first…
+if (!(await panda.close())) {       // …then drain what was captured
+  log.warn("evpanda: shut down with messages still buffered");
+}
+```
+
+`close(timeoutMs?)` drains within `drainTimeout` (or the milliseconds you pass)
+and resolves to whether it managed to. It is idempotent, never rejects, and
+captures after it are safe no-ops.
+
+The flush timer is `unref`'d, so it never holds your process open on its own —
+which also means an unclosed client can lose what it captured since the last
+flush. Close it in your shutdown path.
+
+`flush()` forces an immediate delivery and waits for it. It waits for as long as
+the transport's retries take, so use it at shutdown or while debugging — not on
+a request path.
+
+## Documentation
+
+- [evpanda-go](https://github.com/evpanda-labs/evpanda-go) — the reference
+  implementation this SDK tracks
+- [evpanda-py](https://github.com/evpanda-labs/evpanda-py) — the Python SDK,
+  same pipeline and the same wire records

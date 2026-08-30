@@ -9,7 +9,7 @@
  *      envelope) is replaced with `[redacted]`.
  */
 
-import type { HttpExchange, OCPIMessage } from "../types.js";
+import type { HTTPExchange, OCPIMessage } from "../types.js";
 
 /** Stock OCPI headers safe to capture — none of these can carry a secret. */
 const DEFAULT_OCPI_HEADER_ALLOWLIST: readonly string[] = [
@@ -59,23 +59,31 @@ export function makeOCPIRedactor(
 }
 
 /** Apply the allowlist + credentials-token mask to a captured HTTP envelope. */
-function redactHttp(data: HttpExchange, allow: Set<string>): HttpExchange {
+function redactHttp(data: HTTPExchange, allow: Set<string>): HTTPExchange {
   return {
     ...data,
     requestHeaders: filterHeaders(data.requestHeaders, allow),
     responseHeaders: filterHeaders(data.responseHeaders, allow),
-    requestBody: maskCredentialsToken(data.requestBody, data.url),
-    responseBody: maskCredentialsToken(data.responseBody, data.url),
+    // The chokepoint owns the bodies before the redactor runs, so these
+    // are already bytes.
+    requestBody: maskCredentialsToken(
+      data.requestBody as Uint8Array | undefined,
+      data.url,
+    ),
+    responseBody: maskCredentialsToken(
+      data.responseBody as Uint8Array | undefined,
+      data.url,
+    ),
   };
 }
 
 /** Keep only allowlisted headers; case-insensitive on the key. */
 function filterHeaders(
-  h: Record<string, string>,
+  h: Record<string, string> | undefined,
   allow: Set<string>,
 ): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(h)) {
+  for (const [k, v] of Object.entries(h ?? {})) {
     if (allow.has(k.toLowerCase())) out[k] = v;
   }
   return out;

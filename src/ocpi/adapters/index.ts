@@ -1,4 +1,11 @@
-/** OCPI adapter namespace — re-exported from the package root as `ocpi`. */
+/**
+ * The OCPI adapter namespace, re-exported from the package root as `ocpi`.
+ *
+ * Three adapters, one per HTTP layer a Node service is likely to speak:
+ * `express` for inbound requests, `fetch` and `axios` for outbound ones.
+ * They assemble the exchange, resolve the partner, and call the right
+ * capture method, so a host needs no capture code of its own.
+ */
 
 export { express } from "./express.js";
 export type { OCPIExpressOptions } from "./express.js";
@@ -9,5 +16,15 @@ export type { OCPIFetchOptions } from "./fetch.js";
 export { axios } from "./axios.js";
 export type { OCPIAxiosOptions } from "./axios.js";
 
-// Shipped default resolver — used when an adapter's `resolve` is omitted.
-export { headerResolver, IDENTITY_HEADERS } from "./resolver.js";
+// Identity: the carriers the adapters read, and the resolver contract.
+export {
+  IDENTITY_HEADERS,
+  currentIdentity,
+  defaultResolver,
+  identityFrom,
+  identityFromHeaders,
+  setIdentity,
+  useIdentity,
+} from "./resolver.js";
+
+export type { Capturer, OCPIResolver, RequestInfo } from "./resolver.js";

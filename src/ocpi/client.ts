@@ -1,145 +1,132 @@
 /**
- * OCPIClient — passive OCPI traffic capture. Public surface: `start`,
- * `captureInboundMessage`, `captureOutboundMessage`, `flush`, `close`.
- * Adapters in `./adapters/` receive their capture settings from the client.
+ * OCPIClient — passive OCPI roaming capture, and the `startOCPI` that
+ * builds one.
  */
 
 import { RingBuffer } from "../buffer.js";
-import { resolveOCPIConfig } from "../config.js";
 import { BaseClient } from "../client.js";
-import { makeOCPIRedactor } from "./redact.js";
+import { ConfigError, loggerFor, resolveOCPIConfig } from "../config.js";
 import { Transport } from "../transport.js";
 import { Worker } from "../worker.js";
+import { makeOCPIRedactor } from "./redact.js";
 
-import type { Logger, OCPIConfig } from "../config.js";
+import type { OCPIConfig } from "../config.js";
+import type { HTTPExchange, OCPIDirection, Platform } from "../types.js";
 import type { OCPIRedactor } from "./redact.js";
-import type { OCPIDirection, OCPIMessage, OCPIMessageInput } from "../types.js";
 
 /**
- * Package-private channel from a client to its adapters, carried on the
- * client's `_internal` field. Marked `@internal` there and erased from the
- * published typings by `stripInternal`, so it is not part of the public API.
+ * The input to `captureInboundMessage` and `captureOutboundMessage`. There
+ * is no direction field — the method you call stamps it.
  */
-export interface SdkInternal {
-  /** Resolved per-body cap; adapters use it to bound streaming accumulation. */
-  readonly maxCaptureBytes: number;
-  /** Effective logger (set only when `debug: true`); adapters log faults here. */
-  readonly logger?: Logger;
-}
-
-interface Engine {
-  captureMessage(msg: OCPIMessage): void;
-  flush(): Promise<void>;
-  close(deadlineMs?: number): Promise<void>;
-}
-
-/** Live engine. Building it has no side effects; `start` arms the worker. */
-class ActiveEngine implements Engine {
-  readonly #worker: Worker;
-  readonly #redact: OCPIRedactor;
-  /** Snapshot of resolved fields adapters need; exposed via the bridge. */
-  readonly bridge: SdkInternal;
-
-  constructor(config: OCPIConfig) {
-    const resolved = resolveOCPIConfig(config);
-    this.#worker = new Worker(
-      new RingBuffer(resolved.bufferCapacity),
-      new Transport(resolved),
-      resolved,
-    );
-    this.#redact = makeOCPIRedactor(resolved.ocpiAllowedHeaders);
-    this.bridge = {
-      maxCaptureBytes: resolved.maxCaptureBytes,
-      logger: resolved.logger,
-    };
-  }
-
-  arm(): void {
-    this.#worker.start();
-  }
-
-  captureMessage(msg: OCPIMessage): void {
-    this.#worker.captureOCPI(msg, this.#redact);
-  }
-
-  flush(): Promise<void> {
-    return this.#worker.flushOnce();
-  }
-
-  close(deadlineMs?: number): Promise<void> {
-    return this.#worker.close(deadlineMs);
-  }
-}
-
-/** Inert twin used when construction failed or after `close`. */
-class NoopEngine implements Engine {
-  captureMessage(): void {
-    /* no-op */
-  }
-  flush(): Promise<void> {
-    return Promise.resolve();
-  }
-  close(): Promise<void> {
-    return Promise.resolve();
-  }
+export interface OCPIMessageInput {
+  /** The roaming partner on the other side. Invalid ⇒ message dropped. */
+  identity: Platform;
+  /** The captured HTTP exchange. */
+  data: HTTPExchange;
 }
 
 /**
- * Captures and ships OCPI roaming traffic. Build with [OCPIClient.start] —
- * a bad config never throws; it yields an inert no-op client.
+ * Captures and ships OCPI roaming traffic. Build it with `startOCPI`.
+ *
+ * OCPI traffic flows both ways between roaming partners and the SDK records
+ * each direction separately. There is no direction argument — the method
+ * you call stamps it:
+ *
+ * - `captureInboundMessage` — a partner called your OCPI server. You are
+ *   the server, so you capture the request they sent and the response you
+ *   returned.
+ * - `captureOutboundMessage` — you called a partner's OCPI server. You are
+ *   the client, so you capture the request you sent and the response they
+ *   returned.
+ *
+ * In both cases `identity` is the partner on the other side of the
+ * exchange, never your own platform.
  */
-export class OCPIClient extends BaseClient<Engine> {
+export class OCPIClient extends BaseClient {
   /**
-   * @internal Adapter-only snapshot; `undefined` on an inert client — which is
-   * how adapters short-circuit to a pass-through — and cleared by `close` so a
-   * closed client stops doing capture work. Stripped from the published
-   * typings: not public API, and not to be read or written by consumers.
+   * The header allowlist and credentials mask. `startOCPI` always sets it
+   * on a live client — the chokepoint reads undefined as "nothing to
+   * redact".
    */
-  _internal?: SdkInternal;
+  #redact: OCPIRedactor | undefined;
 
-  private constructor(engine: Engine, internal?: SdkInternal) {
-    super(engine, () => new NoopEngine());
-    this._internal = internal;
+  /** Internal — use `startOCPI`. */
+  protected constructor() {
+    super();
   }
 
   /**
-   * Go inert, then drain. Dropping the channel first means adapters wrapped
-   * around this client fall back to their zero-overhead pass-through instead
-   * of resolving identities and buffering bodies into a no-op engine.
-   * Idempotent; never throws.
+   * Buffer an inbound OCPI message (partner → host) for delivery.
+   *
+   * Non-blocking and never throws; a message with an invalid identity or an
+   * oversize body is silently dropped.
    */
-  override async close(deadlineMs?: number): Promise<void> {
-    this._internal = undefined;
-    await super.close(deadlineMs);
-  }
-
-  /** Build and start. Any fault yields an inert client; never throws to the host. */
-  static start(config: OCPIConfig): OCPIClient {
-    try {
-      const engine = new ActiveEngine(config);
-      engine.arm();
-      return new OCPIClient(engine, engine.bridge);
-    } catch {
-      return new OCPIClient(new NoopEngine());
-    }
-  }
-
-  /** Buffer an inbound OCPI message (partner → host). Non-blocking; never throws. */
   captureInboundMessage(msg: OCPIMessageInput): void {
-    this.#capture(msg, "IN");
+    this.guard("captureInboundMessage", () => this.#capture(msg, "IN"));
   }
 
-  /** Buffer an outbound OCPI message (host → partner). Non-blocking; never throws. */
+  /**
+   * Buffer an outbound OCPI message (host → partner) for delivery.
+   *
+   * Non-blocking and never throws; a message with an invalid identity or an
+   * oversize body is silently dropped.
+   */
   captureOutboundMessage(msg: OCPIMessageInput): void {
-    this.#capture(msg, "OUT");
+    this.guard("captureOutboundMessage", () => this.#capture(msg, "OUT"));
   }
 
-  /** Stamp the direction and hand the full message to the engine. */
+  /**
+   * Stamp the direction and hand the message to the worker, which runs the
+   * validate → cap → own → redact chokepoint.
+   */
   #capture(msg: OCPIMessageInput, direction: OCPIDirection): void {
-    try {
-      this.engine.captureMessage({ ...msg, direction });
-    } catch {
-      /* swallow */
-    }
+    this.worker?.captureOCPI(
+      { direction, platform: msg.identity, data: msg.data },
+      this.#redact,
+    );
   }
+
+  /** @internal Used by `startOCPI` only. */
+  static _build(config: OCPIConfig): OCPIClient {
+    const client = new OCPIClient();
+    try {
+      const resolved = resolveOCPIConfig(config);
+      const counters = client.counters;
+      client.#redact = makeOCPIRedactor(resolved.allowedHeaders);
+      const worker = new Worker(
+        new RingBuffer(resolved.maxBufferBytes, counters),
+        new Transport(resolved, counters),
+        resolved,
+        counters,
+      );
+      worker.start();
+      client.begin(worker);
+    } catch (err) {
+      const error =
+        err instanceof ConfigError
+          ? err
+          : new ConfigError(`@evpanda/sdk: ${String(err)}`);
+      client.fail(error, loggerFor(config));
+    }
+    return client;
+  }
+}
+
+/**
+ * Validate the config, build the client, and start its background worker.
+ *
+ * It always returns a usable `OCPIClient` and never throws. `apiKey` is
+ * hard-required and `endpoint` must parse: if either fails, the returned
+ * client is an inert no-op carrying the fault on `.error`, so a config typo
+ * can never stop the host booting. Every other field is tunable — a bad
+ * value falls back to its default and is reported through `logMode`.
+ *
+ * ```ts
+ * // endpoint defaults to production; apiKey comes from EVPANDA_API_KEY
+ * const panda = startOCPI();
+ * if (panda.error) log.warn(`${panda.error.message} (running inert)`);
+ * ```
+ */
+export function startOCPI(config: OCPIConfig = {}): OCPIClient {
+  return OCPIClient._build(config);
 }

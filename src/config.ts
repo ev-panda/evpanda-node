@@ -1,7 +1,19 @@
 /**
- * Customer-facing configuration. The protocol is the class — there is no
- * `networkType` field. Common fields live on `BaseConfig`; per-protocol
- * extensions add fields only that protocol's client cares about.
+ * Customer-facing configuration.
+ *
+ * The protocol is the client — there is no network-type field. Common
+ * fields live on `BaseConfig`; per-protocol configs add only what that
+ * protocol's client cares about.
+ *
+ * `apiKey` is the one field with no usable default, so a missing key fails
+ * `startOCPI` / `startOCPP` (which hand back an inert client carrying the
+ * error). A malformed `endpoint` fails the same way — but an empty one is
+ * not malformed, it just means production. Every other field is tunable: a
+ * bad value falls back to its default and says so in the host's logs, so a
+ * typo can never silence the SDK entirely.
+ *
+ * Durations are milliseconds, which is what `setTimeout` and every other
+ * Node API speak.
  */
 
 import type { Protocol } from "./types.js";
@@ -14,186 +26,340 @@ export interface Logger {
   error(msg: string, meta?: Record<string, unknown>): void;
 }
 
-/** Fields shared by every protocol's client. */
+/**
+ * How much the SDK says for itself. Unset means the `EVPANDA_LOG`
+ * environment variable decides, and failing that `"errors"`.
+ *
+ * The default is deliberately not silence. An SDK that captures nothing
+ * because its identity resolution is misconfigured looks exactly like an
+ * SDK on an idle system, and a customer should not have to redeploy with a
+ * debug flag to tell those apart. What it will not do is log per event:
+ * problems are summarized once a minute, so a fault that occurs on every
+ * request still costs one line, and a healthy client says nothing at all.
+ *
+ * - `"silent"` — nothing, ever. `stats()` keeps working.
+ * - `"errors"` — the default: config problems at startup, plus a
+ *   once-a-minute summary whenever captures are being dropped.
+ * - `"debug"` — adds per-batch delivery failures, swallowed capture faults,
+ *   and a summary on close even when nothing went wrong.
+ */
+export type LogMode = "silent" | "errors" | "debug";
+
+/**
+ * Lets an operator change the setting without a code change — including
+ * turning the SDK silent during an incident, which is the case that most
+ * needs a restart-only escape hatch.
+ */
+export const LOG_MODE_ENV_VAR = "EVPANDA_LOG";
+
+/** The fallback source for `apiKey` when the config field is empty. */
+export const API_KEY_ENV_VAR = "EVPANDA_API_KEY";
+
+/**
+ * The production ingestion API. A host that never sets `endpoint` reaches
+ * it, which is what almost every host wants; staging deployments set the
+ * field.
+ */
+export const DEFAULT_ENDPOINT = "https://ingest.evpanda.io";
+
+// ── Errors ───────────────────────────────────────────────────────────────
+//
+// startOCPI / startOCPP never throw: the client they return carries the
+// failure on `.error`. The class hierarchy is what `errors.Is` gives the Go
+// SDK — match ConfigError for any configuration fault, or one of the two
+// subclasses to tell a deployment problem (no key) from a code one (bad
+// endpoint).
+
+/** Base class for every error this SDK produces. */
+export class EVPandaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+
+/** A configuration fault. Both specific config errors extend it. */
+export class ConfigError extends EVPandaError {}
+
+/** No API key was found in the config or `EVPANDA_API_KEY`. */
+export class ApiKeyError extends ConfigError {}
+
+/** `endpoint` is not a valid http(s) URL. An empty one is not an error. */
+export class EndpointError extends ConfigError {}
+
+// ── Configuration ────────────────────────────────────────────────────────
+
+/** Fields shared by `OCPIConfig` and `OCPPConfig`. */
 export interface BaseConfig {
-  /** Ingestion API base, e.g. https://ingest.evpanda.io */
-  endpoint: string;
   /**
-   * Sent as X-API-Key. If empty, falls back to the EVPANDA_API_KEY env var;
-   * one of the two must be set.
+   * Ingestion API base. Omitted uses the production default,
+   * `https://ingest.evpanda.io`; set it to reach a different environment.
+   * A non-empty value must be a valid http(s) URL.
+   */
+  endpoint?: string;
+  /**
+   * Sent as the `X-API-Key` header. If omitted it falls back to the
+   * `EVPANDA_API_KEY` environment variable; one of the two must be set.
    */
   apiKey?: string;
 
-  /** Ring buffer slots. Worst-case mem = bufferCapacity × maxCaptureBytes. */
-  bufferCapacity?: number;
-  /** Per-body / per-frame capture cap in bytes. */
+  /**
+   * The ceiling on everything held in memory awaiting delivery. Past it the
+   * oldest captures are evicted, so this is the SDK's memory footprint, not
+   * an estimate of it. Omitted uses the default (32 MiB); the buffer grows
+   * on demand and idles far below it.
+   */
+  maxBufferBytes?: number;
+  /**
+   * The per-body / per-frame capture cap, enforced at capture: an oversize
+   * body or frame drops the whole message. Omitted uses the default
+   * (65536).
+   */
   maxCaptureBytes?: number;
-  /** Worker flush cadence in ms; ~5–10s. */
+  /** Maximum milliseconds between flushes. Omitted uses the default (5000). */
   flushInterval?: number;
-  /** close() drain deadline in ms. Default 10000; explicit value must be ≥ 5000. */
+  /**
+   * How many milliseconds `close()` waits to drain buffered messages.
+   * Omitted uses the default (10000); an explicit value must be >= 5000.
+   */
   drainTimeout?: number;
-  /** Default "zstd". "zstd" needs the optional peer (else gzip fallback). */
-  compression?: "gzip" | "zstd";
-
-  /** Master log switch; default false (totally silent). */
-  debug?: boolean;
+  /**
+   * How much the SDK logs. Omitted consults `EVPANDA_LOG`, then falls back
+   * to `"errors"`.
+   */
+  logMode?: LogMode;
+  /** Receives the SDK's own logs. Omitted uses `console`. */
   logger?: Logger;
 }
 
-/** Configuration for an OCPI roaming gateway client. */
+/** Configuration for `startOCPI`. */
 export interface OCPIConfig extends BaseConfig {
-  /** Extra headers to capture on top of the default allowlist; can't disable defaults. */
+  /**
+   * Extends the default capture allowlist with additional header names
+   * (matched case-insensitively). It can only extend the list, never shrink
+   * it.
+   */
   ocpiAllowedHeaders?: string[];
 }
 
-/** Configuration for an OCPP CSMS client. No protocol-specific fields today. */
+/** Configuration for `startOCPP`. No protocol-specific fields today. */
 export type OCPPConfig = BaseConfig;
 
-// ── Resolved shapes — internal; clients build these from the user config ──
-
-interface ResolvedBase {
+/**
+ * A config with defaults applied and validation passed. Internal: it is
+ * what the worker and the transport read.
+ */
+export interface ResolvedConfig {
   endpoint: string;
   apiKey: string;
   protocol: Protocol;
-  bufferCapacity: number;
+  maxBufferBytes: number;
   maxCaptureBytes: number;
   flushInterval: number;
   drainTimeout: number;
-  compression: "gzip" | "zstd";
-  debug: boolean;
-  /** Non-undefined only when debug is true. */
-  logger?: Logger;
+  logMode: LogMode;
+  /**
+   * The effective logger: undefined exactly when `logMode` is `"silent"`,
+   * so an undefined check is the only silence test callers need.
+   */
+  logger: Logger | undefined;
+  /** The lowercased extra allowlist (OCPI only). */
+  allowedHeaders: readonly string[];
 }
 
-export interface ResolvedOCPIConfig extends ResolvedBase {
-  protocol: "ocpi";
-  ocpiAllowedHeaders: readonly string[];
-}
+// ── Defaults and bounds ──────────────────────────────────────────────────
 
-export interface ResolvedOCPPConfig extends ResolvedBase {
-  protocol: "ocpp";
-}
-
-/** Union the worker / transport accept — they only read the base fields. */
-export type ResolvedConfig = ResolvedOCPIConfig | ResolvedOCPPConfig;
-
-const DEFAULTS = {
-  /** ≤ 1000 server batch cap is the flush trigger; capacity is larger. */
-  bufferCapacity: 10_000,
+/**
+ * `maxBufferBytes` covers roughly one full retry window of a
+ * 10 000-charger CSMS (~400 msg/s at ~500 B) — enough to ride out a blip,
+ * small enough to sit inside an ordinary container limit.
+ */
+export const DEFAULTS = {
+  maxBufferBytes: 32 * 1024 * 1024,
   maxCaptureBytes: 64 * 1024,
   flushInterval: 5_000,
   drainTimeout: 10_000,
-  compression: "zstd",
-  debug: false,
 } as const;
 
-/** Fallback source for apiKey when config.apiKey is empty. */
-const API_KEY_ENV_VAR = "EVPANDA_API_KEY";
+/** One default-sized capture; below it the buffer could not hold one message. */
+export const MIN_MAX_BUFFER_BYTES = 64 * 1024;
+export const MIN_FLUSH_INTERVAL = 1;
+export const MIN_DRAIN_TIMEOUT = 5_000;
 
-const ERR = "@evpanda/sdk config";
+const ERR = "@evpanda/sdk: config";
 
-/** Warn sink for the tunable-field resolvers; logs only when `debug: true`. */
-type Warn = (msg: string) => void;
+// ── Resolution ───────────────────────────────────────────────────────────
 
 /**
- * Build the warn sink over an already-resolved logger — silent when that is
- * undefined, which is the case unless `debug` is on. Taking the logger (not
- * the raw config) keeps the "logger only when debug" rule in one place.
+ * The sink the tunable-field resolvers report to. A no-op when the resolved
+ * logger is undefined (silent), which keeps the silence rule in one place.
+ * A host logger that throws must not fail config resolution either.
  */
+type Warn = (msg: string) => void;
+
 function makeWarn(logger: Logger | undefined): Warn {
   return (msg) => {
-    // A malformed customer logger must not fail config resolution.
     try {
       logger?.warn(`${ERR}: ${msg}`);
     } catch {
-      /* ignore */
+      /* a broken host logger is not our failure */
     }
   };
 }
 
-/** undefined or invalid (non-integer / below min) ⇒ fallback (+ warn). */
+const LOG_MODES: readonly LogMode[] = ["silent", "errors", "debug"];
+
+function isLogMode(value: unknown): value is LogMode {
+  return (
+    typeof value === "string" && LOG_MODES.includes(value.trim() as LogMode)
+  );
+}
+
+/**
+ * Apply the config field, then the environment, then the default. An
+ * unrecognised value in either falls back to `"errors"` — a typo must not
+ * silence the SDK, which is the whole point of the default.
+ *
+ * Config wins over the environment, matching how `apiKey` resolves. Since
+ * most hosts never set the field, `EVPANDA_LOG` still reaches almost every
+ * deployment, which is what makes it usable as an incident escape hatch.
+ */
+export function resolveLogMode(value: unknown): {
+  mode: LogMode;
+  warning?: string;
+} {
+  const quoted = LOG_MODES.map((m) => `"${m}"`).join(", ");
+  if (value !== undefined) {
+    if (isLogMode(value)) return { mode: value.trim() as LogMode };
+    return {
+      mode: "errors",
+      warning: `\`logMode\` must be one of ${quoted}; using "errors"`,
+    };
+  }
+  const env = process.env[LOG_MODE_ENV_VAR]?.trim().toLowerCase();
+  if (env === undefined || env === "") return { mode: "errors" };
+  if (isLogMode(env)) return { mode: env };
+  return {
+    mode: "errors",
+    warning: `${LOG_MODE_ENV_VAR} must be one of ${quoted}; using "errors"`,
+  };
+}
+
+/**
+ * The logger to use, or undefined when the mode is silent. An undefined
+ * logger is the single signal for "say nothing".
+ */
+export function effectiveLogger(
+  logger: Logger | undefined,
+  mode: LogMode,
+): Logger | undefined {
+  if (mode === "silent") return undefined;
+  return logger ?? console;
+}
+
+/** The configured key, or `EVPANDA_API_KEY`, or throw. */
+function resolveApiKey(value: unknown): string {
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  const env = process.env[API_KEY_ENV_VAR];
+  if (typeof env === "string" && env.trim() !== "") return env.trim();
+  throw new ApiKeyError(
+    `${ERR}: no API key — set \`apiKey\` or the ${API_KEY_ENV_VAR} environment variable`,
+  );
+}
+
+/**
+ * Default an empty value to production, else require a valid http(s) URL.
+ * Trailing slashes are trimmed; the transport appends `/v1/{protocol}`.
+ */
+export function resolveEndpoint(raw: unknown): string {
+  if (raw === undefined || raw === null) return DEFAULT_ENDPOINT;
+  if (typeof raw !== "string") {
+    throw new EndpointError(`${ERR}: \`endpoint\` must be a string`);
+  }
+  const value = raw.trim();
+  if (value === "") return DEFAULT_ENDPOINT;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new EndpointError(`${ERR}: \`endpoint\` "${value}" is not a valid URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new EndpointError(
+      `${ERR}: \`endpoint\` "${value}" must use http or https`,
+    );
+  }
+  return value.replace(/\/+$/, "");
+}
+
+/**
+ * Undefined, the wrong type, or below the minimum ⇒ the default (with a
+ * warning on the last two).
+ */
 function resolveInt(
-  value: number | undefined,
+  value: unknown,
   fallback: number,
   field: string,
   min: number,
   warn: Warn,
 ): number {
   if (value === undefined) return fallback;
-  if (!Number.isInteger(value) || value < min) {
-    warn(`\`${field}\` must be an integer >= ${min}; using default ${fallback}`);
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    warn(`\`${field}\` must be an integer; using default ${fallback}`);
+    return fallback;
+  }
+  if (value < min) {
+    warn(`\`${field}\` must be >= ${min}; using default ${fallback}`);
     return fallback;
   }
   return value;
 }
 
-const resolveEndpoint = (raw: unknown): string => {
-  if (typeof raw !== "string" || raw.trim() === "") {
-    throw new Error(
-      `${ERR}: \`endpoint\` is required and must be a non-empty string`,
-    );
-  }
-  const s = raw.trim();
-  let url: URL;
-  try {
-    url = new URL(s);
-  } catch {
-    throw new Error(`${ERR}: 'endpoint' must be a valid URL`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${ERR}: 'endpoint' must use http or https`);
-  }
-  return s.replace(/\/+$/, ""); // transport appends /v1/{protocol}
-};
-
 /**
- * config.apiKey, or the EVPANDA_API_KEY env var, or throws if neither is
- * set.
+ * Trim, lowercase and deduplicate (preserving order), skipping empties. A
+ * non-array is ignored with a warning, so one mistyped field cannot take
+ * the allowlist down with it.
  */
-function resolveApiKey(value: unknown): string {
-  if (typeof value === "string" && value.trim() !== "") return value.trim();
-  const env = process.env[API_KEY_ENV_VAR];
-  if (typeof env === "string" && env.trim() !== "") return env.trim();
-  throw new Error(
-    `${ERR}: \`apiKey\` is required — set \`apiKey\` or the ${API_KEY_ENV_VAR} env var`,
-  );
-}
-
-/** undefined or invalid ⇒ "zstd" default (+ warn); else the given codec. */
-function resolveCompression(value: unknown, warn: Warn): "gzip" | "zstd" {
-  if (value === undefined) return DEFAULTS.compression;
-  if (value === "gzip" || value === "zstd") return value;
-  warn(
-    `\`compression\` must be "gzip" or "zstd"; using default ${DEFAULTS.compression}`,
-  );
-  return DEFAULTS.compression;
+function resolveAllowedHeaders(value: unknown, warn: Warn): readonly string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    warn("`ocpiAllowedHeaders` must be a string array; ignoring it");
+    return [];
+  }
+  const out = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      warn("`ocpiAllowedHeaders` entries must be strings; skipping one");
+      continue;
+    }
+    const name = entry.trim().toLowerCase();
+    if (name) out.add(name);
+  }
+  return Object.freeze([...out]);
 }
 
 /**
- * Resolve the shared fields. `endpoint` / `apiKey` are hard-required — a bad
- * value throws (⇒ inert SDK); tunable fields fall back to their default.
+ * Apply defaults and validate the shared fields. Only `endpoint` and
+ * `apiKey` can fail.
  */
-function resolveBase<P extends Protocol>(
-  config: BaseConfig,
-  protocol: P,
-): ResolvedBase & { protocol: P } {
+function resolveBase(config: BaseConfig, protocol: Protocol): ResolvedConfig {
   if (config === null || typeof config !== "object") {
-    throw new Error(`${ERR}: a config object is required`);
+    throw new ConfigError(`${ERR}: a config object is required`);
   }
-  const debug = config.debug === true;
-  const logger: Logger | undefined = debug
-    ? (config.logger ?? console)
-    : undefined;
+  const { mode, warning } = resolveLogMode(config.logMode);
+  const logger = effectiveLogger(config.logger, mode);
   const warn = makeWarn(logger);
-  return {
+  if (warning !== undefined) warn(warning);
+
+  const resolved: ResolvedConfig = {
     endpoint: resolveEndpoint(config.endpoint),
     apiKey: resolveApiKey(config.apiKey),
     protocol,
-    bufferCapacity: resolveInt(
-      config.bufferCapacity,
-      DEFAULTS.bufferCapacity,
-      "bufferCapacity",
-      1,
+    maxBufferBytes: resolveInt(
+      config.maxBufferBytes,
+      DEFAULTS.maxBufferBytes,
+      "maxBufferBytes",
+      MIN_MAX_BUFFER_BYTES,
       warn,
     ),
     maxCaptureBytes: resolveInt(
@@ -207,59 +373,57 @@ function resolveBase<P extends Protocol>(
       config.flushInterval,
       DEFAULTS.flushInterval,
       "flushInterval",
-      1,
+      MIN_FLUSH_INTERVAL,
       warn,
     ),
     drainTimeout: resolveInt(
       config.drainTimeout,
       DEFAULTS.drainTimeout,
       "drainTimeout",
-      5_000,
+      MIN_DRAIN_TIMEOUT,
       warn,
     ),
-    compression: resolveCompression(config.compression, warn),
-    debug,
+    logMode: mode,
     logger,
+    allowedHeaders: [],
   };
+
+  // Both values are individually legal but nonsensical together: a capture
+  // at the per-message cap would never fit in the buffer, so every large
+  // message would be dropped after being redacted.
+  if (resolved.maxBufferBytes < resolved.maxCaptureBytes) {
+    warn(
+      `\`maxBufferBytes\` (${resolved.maxBufferBytes}) is below \`maxCaptureBytes\` ` +
+        `(${resolved.maxCaptureBytes}); a full-size capture can never be buffered`,
+    );
+  }
+  return resolved;
 }
 
-export function resolveOCPIConfig(config: OCPIConfig): ResolvedOCPIConfig {
+/** Resolve an `OCPIConfig`. Throws a `ConfigError` on a hard fault. */
+export function resolveOCPIConfig(config: OCPIConfig): ResolvedConfig {
   const base = resolveBase(config, "ocpi");
   return {
     ...base,
-    ocpiAllowedHeaders: resolveOCPIAllowedHeaders(
+    allowedHeaders: resolveAllowedHeaders(
       config.ocpiAllowedHeaders,
       makeWarn(base.logger),
     ),
   };
 }
 
-export function resolveOCPPConfig(config: OCPPConfig): ResolvedOCPPConfig {
+/** Resolve an `OCPPConfig`. Throws a `ConfigError` on a hard fault. */
+export function resolveOCPPConfig(config: OCPPConfig): ResolvedConfig {
   return resolveBase(config, "ocpp");
 }
 
 /**
- * Coerce to a trimmed, lowercased, deduplicated, immutable list. A
- * non-array value falls back to `[]` (+ warn); a non-string entry is
- * skipped (+ warn) so the good entries still apply.
+ * The logger a config would use, without validating anything else.
+ * `startOCPI` / `startOCPP` need it on the one path where there is no
+ * resolved config to read it from: reporting the fault that stopped the
+ * config from resolving at all.
  */
-function resolveOCPIAllowedHeaders(
-  value: unknown,
-  warn: Warn,
-): readonly string[] {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) {
-    warn("`ocpiAllowedHeaders` must be a string array; ignoring it");
-    return [];
-  }
-  const out = new Set<string>();
-  for (const v of value) {
-    if (typeof v !== "string") {
-      warn("`ocpiAllowedHeaders` entries must be strings; skipping one");
-      continue;
-    }
-    const trimmed = v.trim().toLowerCase();
-    if (trimmed) out.add(trimmed);
-  }
-  return Object.freeze([...out]);
+export function loggerFor(config: BaseConfig): Logger | undefined {
+  const { mode } = resolveLogMode(config?.logMode);
+  return effectiveLogger(config?.logger, mode);
 }

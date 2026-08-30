@@ -1,0 +1,87 @@
+# The quality gate, defined once and called by both build.yml (pushes and
+# pull requests) and release.yml (tags). Keeping it in one place is the
+# point: a release must clear exactly the same bar as a pull request, and
+# two copies of these steps would eventually disagree.
+name: Checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines: node >= 22.15, which is where node:zlib gained zstd.
+        # Test that floor and every supported LTS above it; 18 and 20 are
+        # both past end-of-life.
+        node: ["22.15", 22, 24]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          # No `cache: npm` and no `npm ci`: the repo is intentionally
+          # manager-agnostic and commits no lockfile (see .gitignore).
+
+      - run: npm install --no-audit --no-fund
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - run: npm install --no-audit --no-fund
+
+      - run: npm run build
+
+      # The SDK has no runtime dependencies, so the published tarball must
+      # import cleanly on its own. Packing and installing it somewhere else
+      # is what proves that — and that a file did not fall out of `files`.
+      - name: Import the packed tarball, away from the source tree
+        run: |
+          set -euo pipefail
+          tarball="$(npm pack --silent)"
+          mkdir -p /tmp/pack-check && mv "$tarball" /tmp/pack-check/
+          cd /tmp/pack-check
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "./$tarball"
+          node --input-type=module -e "
+            import { startOCPI, startOCPP, ocpi } from '@evpanda/sdk';
+            const panda = startOCPI({ logMode: 'silent' });
+            if (panda.error?.name !== 'ApiKeyError') throw new Error('inert client expected');
+            if (typeof ocpi.express !== 'function') throw new Error('adapters missing');
+            if (typeof startOCPP !== 'function') throw new Error('OCPP entry missing');
+            console.log('packed tarball imports cleanly');
+          "
+          node -e "
+            const { startOCPI } = require('@evpanda/sdk');
+            if (typeof startOCPI !== 'function') throw new Error('cjs entry missing');
+            console.log('cjs entry loads');
+          "
