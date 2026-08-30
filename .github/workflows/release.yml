@@ -1,5 +1,6 @@
-# Publishes @evpanda/sdk to npm when a semver tag is pushed, and cuts the
-# matching GitHub Release.
+# Cuts a release when a semver tag is pushed.
+#
+# Publishes @evpanda/sdk to npm, then cuts the matching GitHub Release.
 #
 # To release:
 #   1. bump "version" in package.json, and merge it
@@ -15,6 +16,9 @@
 #
 # npm publishes with provenance (a supply-chain attestation), which needs
 # id-token: write and a public scoped package.
+#
+# The four jobs are the same four in all three EVPanda SDKs:
+#   validate-tag → checks → publish → github-release
 name: Release
 
 on:
@@ -29,11 +33,11 @@ jobs:
     name: Validate tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Check the tag is a semver version
+      - name: Check the tag is a valid version
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -43,7 +47,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check the tag matches package.json
+      - name: Check the tag matches the version in the tree
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -87,17 +91,19 @@ jobs:
     permissions:
       id-token: write # npm provenance
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - run: npm install --no-audit --no-fund
+      - name: Install
+        run: npm install --no-audit --no-fund
 
       # prepublishOnly (build) runs automatically before publish.
-      - run: npm publish --provenance --access public
+      - name: Publish
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -108,7 +114,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
