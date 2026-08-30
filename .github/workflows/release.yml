@@ -10,12 +10,14 @@
 # tag cannot drift — validate-tag fails the release if they disagree. npm
 # rejects re-publishing an existing version, so a bump is not optional.
 #
-# Prerequisites (one-time):
-#   - Repo secret NPM_TOKEN: an npm automation token with publish rights to
-#     the @evpanda scope.
+# Prerequisites (one-time, no secrets):
+#   - npm trusted publishing: on npmjs.com, add a trusted publisher for
+#     @evpanda/sdk pointing at repo `evpanda-labs/evpanda-node`, workflow
+#     `release.yml`, no environment, action `npm publish`.
 #
-# npm publishes with provenance (a supply-chain attestation), which needs
-# id-token: write and a public scoped package.
+# Publishing uses OIDC (id-token: write) — no API token to store or rotate.
+# npm also attaches provenance, a supply-chain attestation, which the same
+# permission covers.
 #
 # The four jobs are the same four in all three EVPanda SDKs:
 #   validate-tag → checks → publish → github-release
@@ -70,15 +72,6 @@ jobs:
             exit 1
           fi
 
-      - name: Require NPM_TOKEN
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NPM_TOKEN" ]; then
-            echo "::error::NPM_TOKEN is not set — add it in Settings → Secrets and variables → Actions."
-            exit 1
-          fi
-
   # The same gate a pull request clears, re-run against the tagged commit.
   checks:
     needs: validate-tag
@@ -98,14 +91,26 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # Trusted publishing needs npm 11.5.1 or later, and no runner ships
+      # one that new with Node 22. Installing it explicitly also means the
+      # publish does not silently change behaviour the day a runner image
+      # bumps its bundled npm.
+      - name: Use an npm that can do trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
       - name: Install
         run: npm install --no-audit --no-fund
 
+      # No NODE_AUTH_TOKEN: npm authenticates over OIDC against the trusted
+      # publisher configured for this package — same model as the Python
+      # SDK's PyPI publish. There is no token to expire, which is exactly
+      # what broke the first attempt at this release.
+      #
       # prepublishOnly (build) runs automatically before publish.
       - name: Publish
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   github-release:
     name: Create the GitHub Release
