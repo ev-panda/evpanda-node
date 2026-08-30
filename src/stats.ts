@@ -149,22 +149,32 @@ export function subtract(current: Stats, previous: Stats): Stats {
 }
 
 /**
+ * The key each counter is logged under. Deliberately not the field names:
+ * the health line is operator-facing, and an operator grepping a polyglot
+ * fleet should see one vocabulary, not three. All three SDKs emit exactly
+ * these keys.
+ */
+const LOG_KEYS: readonly (readonly [string, keyof Stats])[] = [
+  ["captured", "captured"],
+  ["invalid_identity", "droppedInvalid"],
+  ["oversize", "droppedOversize"],
+  ["evicted", "droppedEvicted"],
+  ["undeliverable", "droppedUndeliverable"],
+  ["fault", "droppedFault"],
+];
+
+/**
  * Render a snapshot as `key=value` pairs, omitting zero counters. Keeping
  * the line to what actually happened is what makes it readable at a glance
  * in a production log.
  */
 export function logLine(stats: Stats): string {
   const parts: string[] = [];
-  const add = (key: string, value: number): void => {
+  for (const [key, field] of LOG_KEYS) {
+    const value = stats[field];
     if (value !== 0) parts.push(`${key}=${value}`);
-  };
-  add("captured", stats.captured);
-  add("droppedInvalid", stats.droppedInvalid);
-  add("droppedOversize", stats.droppedOversize);
-  add("droppedEvicted", stats.droppedEvicted);
-  add("droppedUndeliverable", stats.droppedUndeliverable);
-  add("droppedFault", stats.droppedFault);
+  }
   parts.push(`buffered=${stats.bufferedMessages}`);
-  parts.push(`bufferBytes=${stats.bufferBytes}`);
+  parts.push(`buffer_bytes=${stats.bufferBytes}`);
   return parts.join(" ");
 }

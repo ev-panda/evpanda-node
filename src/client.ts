@@ -169,7 +169,7 @@ export abstract class BaseClient {
     const config = this.#worker?.config;
     if (config?.logger === undefined || config.logMode !== "debug") return;
     try {
-      config.logger.warn("@evpanda/sdk: capture failed", { op, error: err });
+      config.logger.warn("evpanda: capture failed", { op, error: err });
     } catch {
       /* reporting must not throw either */
     }

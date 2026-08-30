@@ -18,6 +18,10 @@ export type { OCPIAxiosOptions } from "./axios.js";
 
 // Identity: the carriers the adapters read, and the resolver contract.
 export {
+  HEADER_PLATFORM_ID,
+  HEADER_PLATFORM_NAME,
+  HEADER_TENANT_ID,
+  HEADER_TENANT_NAME,
   IDENTITY_HEADERS,
   currentIdentity,
   defaultResolver,
@@ -27,4 +31,4 @@ export {
   useIdentity,
 } from "./resolver.js";
 
-export type { Capturer, OCPIResolver, RequestInfo } from "./resolver.js";
+export type { Capturer, RequestInfo, Resolver } from "./resolver.js";

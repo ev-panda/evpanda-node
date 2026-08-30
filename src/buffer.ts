@@ -55,7 +55,7 @@ export class RingBuffer {
   ) {
     if (!Number.isInteger(_maxBytes) || _maxBytes < 1) {
       throw new Error(
-        "@evpanda/sdk: buffer byte budget must be a positive integer",
+        "evpanda: buffer byte budget must be a positive integer",
       );
     }
   }

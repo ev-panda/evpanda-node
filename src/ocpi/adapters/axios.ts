@@ -16,7 +16,7 @@
  */
 
 import {
-  IDENTITY_HEADER_NAMES,
+  IDENTITY_HEADERS,
   capturing,
   currentIdentity,
   resolve as resolveIdentity,
@@ -28,7 +28,7 @@ import type {
   AxiosResponse,
   InternalAxiosRequestConfig,
 } from "axios";
-import type { Capturer, OCPIResolver } from "./resolver.js";
+import type { Capturer, Resolver } from "./resolver.js";
 import type { HTTPExchange, Platform } from "../../types.js";
 
 export interface OCPIAxiosOptions {
@@ -36,7 +36,7 @@ export interface OCPIAxiosOptions {
    * Identity resolver, invoked for every outbound request. Omitted ⇒ the
    * shipped `X-EVPanda-*` header reader.
    */
-  resolve?: OCPIResolver;
+  resolver?: Resolver;
 }
 
 /** Carried on `config` from request → response so capture can re-assemble. */
@@ -69,7 +69,7 @@ export function axios(
     const maxCaptureBytes = capturing(sdk);
     if (maxCaptureBytes !== undefined) {
       try {
-        const identity = resolveIdentity(opts.resolve, {
+        const identity = resolveIdentity(opts.resolver, {
           method: (config.method ?? "get").toUpperCase(),
           url: safeGetUri(instance, config),
           requestHeaders: axiosHeadersToRecord(config.headers),
@@ -169,11 +169,11 @@ function stripIdentityHeaders(h: unknown): void {
     delete?: (name: string) => void;
   } & Record<string, unknown>;
   if (typeof bag.delete === "function") {
-    for (const name of IDENTITY_HEADER_NAMES) bag.delete(name);
+    for (const name of IDENTITY_HEADERS) bag.delete(name);
     return;
   }
   for (const key of Object.keys(bag)) {
-    if (IDENTITY_HEADER_NAMES.includes(key.toLowerCase())) delete bag[key];
+    if (IDENTITY_HEADERS.includes(key.toLowerCase())) delete bag[key];
   }
 }
 

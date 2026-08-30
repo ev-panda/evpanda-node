@@ -2,6 +2,11 @@
 # pull requests) and release.yml (tags). Keeping it in one place is the
 # point: a release must clear exactly the same bar as a pull request, and
 # two copies of these steps would eventually disagree.
+#
+# Three jobs, the same three in all three EVPanda SDKs:
+#   lint     — once, since it does not vary by runtime version
+#   test     — across every supported runtime
+#   package  — prove what ships actually works, from outside this repo
 name: Checks
 
 on:
@@ -15,11 +20,14 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+
       - run: npm install --no-audit --no-fund
+
       - run: npm run lint
 
   test:
@@ -33,9 +41,9 @@ jobs:
         # both past end-of-life.
         node: ["22.15", 22, 24]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           # No `cache: npm` and no `npm ci`: the repo is intentionally
@@ -51,9 +59,9 @@ jobs:
     name: Package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 

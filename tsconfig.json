@@ -9,8 +9,8 @@
     "lib": ["ES2022"],
     "types": ["node"],
     "noEmit": true,
-    // Erases `@internal` members (e.g. OCPIClient#_internal) from the emitted
-    // .d.ts — the adapter channel must not appear in the public typings.
+    // Erases `@internal` members — `OCPIClient._build` and `OCPPClient._build`
+    // are construction details `startOCPI`/`startOCPP` own, not public API.
     "stripInternal": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -22,5 +22,8 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src"]
+  // The tests are typechecked too. They are the first consumer of the public
+  // API, so a rename that leaves one behind should fail the typecheck rather
+  // than surface later as a runtime assertion.
+  "include": ["src", "test"]
 }

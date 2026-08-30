@@ -13,13 +13,13 @@
  */
 
 import {
-  IDENTITY_HEADER_NAMES,
+  IDENTITY_HEADERS,
   capturing,
   currentIdentity,
   resolve as resolveIdentity,
 } from "./resolver.js";
 
-import type { Capturer, OCPIResolver } from "./resolver.js";
+import type { Capturer, Resolver } from "./resolver.js";
 import type { HTTPExchange, Platform } from "../../types.js";
 
 export interface OCPIFetchOptions {
@@ -27,7 +27,7 @@ export interface OCPIFetchOptions {
    * Identity resolver, invoked for every outbound request. Omitted ⇒ the
    * shipped `X-EVPanda-*` header reader.
    */
-  resolve?: OCPIResolver;
+  resolver?: Resolver;
 }
 
 /**
@@ -64,9 +64,9 @@ export function fetch(
     // Snapshot before stripping: the resolver still sees the identity
     // headers, the partner never does.
     const requestHeaders = headersToRecord(request.headers);
-    for (const name of IDENTITY_HEADER_NAMES) request.headers.delete(name);
+    for (const name of IDENTITY_HEADERS) request.headers.delete(name);
 
-    const identity = resolveIdentity(opts.resolve, {
+    const identity = resolveIdentity(opts.resolver, {
       method: request.method,
       url: request.url,
       requestHeaders,
