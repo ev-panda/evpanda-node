@@ -1,230 +1,196 @@
 /**
- * OCPPClient — passive OCPP CSMS traffic capture.
- *
- * Two ways to capture:
- *   - `connection(identity)` — the recommended path: a session handle that
- *     owns the `connectionId` and carries the identity. Attach it to your
- *     WebSocket and call `message` / `disconnect`.
- *   - `captureConnect` / `captureMessage` / `captureDisconnect` — the flat
- *     primitives the session is built on, for one-off capture.
- *
- * Identity is a `ChargerIdentity` literal; an invalid one is dropped.
+ * OCPPClient — passive OCPP CSMS capture, the session handle, and the
+ * `startOCPP` that builds a client.
  */
 
 import { randomUUID } from "node:crypto";
 
 import { RingBuffer } from "../buffer.js";
-import { resolveOCPPConfig } from "../config.js";
-import { validateChargerIdentity } from "../identity.js";
 import { BaseClient } from "../client.js";
-import { makeOCPPRedactor } from "./redact.js";
+import { ConfigError, loggerFor, resolveOCPPConfig } from "../config.js";
 import { Transport } from "../transport.js";
-import { Worker } from "../worker.js";
 import { OCPPEventType } from "../types.js";
+import { Worker } from "../worker.js";
 
-import type { OCPPConfig, Logger } from "../config.js";
-import type { ChargerIdentity } from "../identity.js";
+import type { OCPPConfig } from "../config.js";
+import type { BodyInput, Charger, OCPPDirection } from "../types.js";
 import type { OCPPRedactor } from "./redact.js";
-import type { OCPPDirection, OCPPMessage } from "../types.js";
 
 /**
- * Input shape for all three OCPP capture methods. `data` / `direction` are
- * optional on the type because connect/disconnect don't carry a frame;
- * `captureMessage` requires both and drops the message if either is missing.
+ * The input shape for the three flat OCPP capture primitives. `data` and
+ * `direction` are only used by `captureMessage`, which requires both and
+ * drops the message if either is missing; connect and disconnect carry no
+ * frame.
  */
 export interface OCPPMessageInput {
   /** The charge point this event belongs to. Invalid ⇒ message dropped. */
-  identity: ChargerIdentity;
-  /** Stable for the lifetime of this connection; minted by the caller. */
+  identity: Charger;
+  /**
+   * Stable for the lifetime of this connection. The session handle returned
+   * by `connection()` mints and carries it for you.
+   */
   connectionId: string;
-  /** Frame bytes (strings → UTF-8). Required by `captureMessage`. */
-  data?: Uint8Array | string;
-  /** Frame direction. Required by `captureMessage`. */
+  /** The raw frame. Required by `captureMessage`. */
+  data?: BodyInput;
+  /** The frame direction. Required by `captureMessage`. */
   direction?: OCPPDirection;
 }
 
 /**
- * A live capture handle for one OCPP WebSocket connection. Returned by
- * `OCPPClient.connection`; it owns the `connectionId` and the identity so
- * per-frame calls carry neither. Attach it to your connection object and
- * call `message` per frame, `disconnect` when the socket closes.
+ * A live capture handle for one OCPP WebSocket connection.
+ *
+ * Returned by `OCPPClient.connection`, it owns the connection ID and the
+ * identity so per-frame calls carry neither. Attach it to your connection
+ * object and call `message` per frame, `disconnect` when the socket closes.
  */
 export interface OCPPSession {
-  /** SDK-minted id for this connection — fresh per `connection()` call. */
+  /**
+   * The SDK-minted ID for this connection — fresh per `connection()` call,
+   * which is how the ingestion side separates one charger's sessions across
+   * reconnects.
+   */
   readonly connectionId: string;
   /** Capture one OCPP frame. Oversize frames are dropped. */
-  message(data: Uint8Array | string, direction: OCPPDirection): void;
+  message(data: BodyInput, direction: OCPPDirection): void;
   /** Capture the connection closing. */
   disconnect(): void;
 }
 
-interface Engine {
-  enqueue(msg: OCPPMessage): void;
-  maxCaptureBytes(): number;
-  /** Effective logger (set only when `debug: true`); undefined ⇒ silent. */
-  logger(): Logger | undefined;
-  flush(): Promise<void>;
-  close(deadlineMs?: number): Promise<void>;
-}
-
-class ActiveEngine implements Engine {
-  readonly #worker: Worker;
-  readonly #maxCaptureBytes: number;
-  readonly #logger: Logger | undefined;
-  readonly #redact: OCPPRedactor;
-
-  constructor(config: OCPPConfig) {
-    const resolved = resolveOCPPConfig(config);
-    const buffer = new RingBuffer(resolved.bufferCapacity);
-    this.#worker = new Worker(buffer, new Transport(resolved), resolved);
-    this.#maxCaptureBytes = resolved.maxCaptureBytes;
-    this.#logger = resolved.logger;
-    this.#redact = makeOCPPRedactor();
-  }
-
-  arm(): void {
-    this.#worker.start();
-  }
-
-  enqueue(msg: OCPPMessage): void {
-    this.#worker.captureOCPP(msg, this.#redact);
-  }
-
-  maxCaptureBytes(): number {
-    return this.#maxCaptureBytes;
-  }
-
-  logger(): Logger | undefined {
-    return this.#logger;
-  }
-
-  flush(): Promise<void> {
-    return this.#worker.flushOnce();
-  }
-
-  close(deadlineMs?: number): Promise<void> {
-    return this.#worker.close(deadlineMs);
-  }
-}
-
-class NoopEngine implements Engine {
-  enqueue(): void {
-    /* no-op */
-  }
-  maxCaptureBytes(): number {
-    // Generous so the message-frame oversize check never short-circuits
-    // here; the noop engine would drop the message anyway.
-    return Number.POSITIVE_INFINITY;
-  }
-  logger(): Logger | undefined {
-    return undefined;
-  }
-  flush(): Promise<void> {
-    return Promise.resolve();
-  }
-  close(): Promise<void> {
-    return Promise.resolve();
-  }
-}
-
 /**
- * Captures and ships OCPP CSMS traffic. Build with [OCPPClient.start] —
- * a bad config never throws; it yields an inert no-op client.
+ * Captures and ships OCPP CSMS traffic. Build it with `startOCPP`.
+ *
+ * There are two ways to capture:
+ *
+ * - `connection()` — the recommended path: a session handle that owns the
+ *   connection ID and carries the identity. Attach it to your WebSocket and
+ *   call `message` per frame, `disconnect` on close.
+ * - `captureConnect` / `captureMessage` / `captureDisconnect` — the flat
+ *   primitives the session is built on, for one-off capture.
+ *
+ * `identity` is a `Charger` value, not a resolver: OCPP identity is known
+ * at connect time. An invalid one drops the message.
  */
-export class OCPPClient extends BaseClient<Engine> {
-  private constructor(engine: Engine) {
-    super(engine, () => new NoopEngine());
-  }
+export class OCPPClient extends BaseClient {
+  /**
+   * undefined today: OCPP frames are captured verbatim, and the chokepoint
+   * reads undefined as "nothing to redact". See ocpp/redact.ts.
+   */
+  #redact: OCPPRedactor | undefined;
 
-  /** Build and start. Any fault yields an inert client; never throws to the host. */
-  static start(config: OCPPConfig): OCPPClient {
-    try {
-      const engine = new ActiveEngine(config);
-      engine.arm();
-      return new OCPPClient(engine);
-    } catch {
-      return new OCPPClient(new NoopEngine());
-    }
+  /** Internal — use `startOCPP`. */
+  protected constructor() {
+    super();
   }
 
   /**
-   * Open a capture session for one OCPP connection: mints a `connectionId`,
-   * records the connect, and returns an {@link OCPPSession}. Attach the
-   * handle to your WebSocket.
+   * Open a capture session for one OCPP connection: mint a connection ID,
+   * record the connect, and hand back the session.
+   *
+   * Use one per socket — its connection ID ties the connect, every frame
+   * and the disconnect into a single session, and a reconnect gets a fresh
+   * one.
    */
-  connection(identity: ChargerIdentity): OCPPSession {
+  connection(identity: Charger): OCPPSession {
     const connectionId = randomUUID();
     this.captureConnect({ identity, connectionId });
     return {
       connectionId,
-      message: (data, direction) =>
-        this.captureMessage({ identity, connectionId, data, direction }),
-      disconnect: () => this.captureDisconnect({ identity, connectionId }),
+      message: (data, direction) => {
+        this.captureMessage({ identity, connectionId, data, direction });
+      },
+      disconnect: () => {
+        this.captureDisconnect({ identity, connectionId });
+      },
     };
   }
 
-  /** Record a new OCPP connection. Uses `identity` + `connectionId` only. */
-  captureConnect(input: OCPPMessageInput): void {
-    try {
-      if (!validateChargerIdentity(input.identity)) return;
-      this.engine.enqueue({
-        eventType: OCPPEventType.Connect,
-        identity: input.identity,
-        connectionId: input.connectionId,
-      });
-    } catch (err) {
-      this.#logFault("captureConnect", err);
-    }
-  }
-
-  /** Record one OCPP frame. Requires `data` + `direction`; oversize ⇒ dropped. */
-  captureMessage(input: OCPPMessageInput): void {
-    try {
-      if (input.data == null || input.direction == null) return;
-      if (!validateChargerIdentity(input.identity)) return;
-      const encoded = encodeFrame(input.data, this.engine.maxCaptureBytes());
-      if (encoded.overflowed) return;
-      this.engine.enqueue({
-        eventType: OCPPEventType.Message,
-        identity: input.identity,
-        connectionId: input.connectionId,
-        direction: input.direction,
-        payload: encoded.payload,
-      });
-    } catch (err) {
-      this.#logFault("captureMessage", err);
-    }
-  }
-
-  /** Record the connection closing. Uses `identity` + `connectionId` only. */
-  captureDisconnect(input: OCPPMessageInput): void {
-    try {
-      if (!validateChargerIdentity(input.identity)) return;
-      this.engine.enqueue({
-        eventType: OCPPEventType.Disconnect,
-        identity: input.identity,
-        connectionId: input.connectionId,
-      });
-    } catch (err) {
-      this.#logFault("captureDisconnect", err);
-    }
-  }
-
-  /** Surface a swallowed capture fault when a debug logger is configured. */
-  #logFault(op: string, err: unknown): void {
-    this.engine.logger()?.warn(`@evpanda/sdk: OCPP ${op} failed`, {
-      error: String(err),
+  /** Record a new OCPP connection. Non-blocking and never throws. */
+  captureConnect(msg: OCPPMessageInput): void {
+    this.guard("captureConnect", () => {
+      this.worker?.captureOCPP(
+        {
+          eventType: OCPPEventType.Connect,
+          charger: msg.identity,
+          connectionId: msg.connectionId,
+        },
+        this.#redact,
+      );
     });
+  }
+
+  /**
+   * Record one OCPP frame.
+   *
+   * It requires `data` and `direction` and drops the message if either is
+   * missing; oversize frames are dropped too. Non-blocking and never
+   * throws.
+   */
+  captureMessage(msg: OCPPMessageInput): void {
+    this.guard("captureMessage", () => {
+      this.worker?.captureOCPP(
+        {
+          eventType: OCPPEventType.Message,
+          charger: msg.identity,
+          connectionId: msg.connectionId,
+          direction: msg.direction,
+          payload: msg.data as Uint8Array | undefined,
+        },
+        this.#redact,
+      );
+    });
+  }
+
+  /** Record the connection closing. Non-blocking and never throws. */
+  captureDisconnect(msg: OCPPMessageInput): void {
+    this.guard("captureDisconnect", () => {
+      this.worker?.captureOCPP(
+        {
+          eventType: OCPPEventType.Disconnect,
+          charger: msg.identity,
+          connectionId: msg.connectionId,
+        },
+        this.#redact,
+      );
+    });
+  }
+
+  /** @internal Used by `startOCPP` only. */
+  static _build(config: OCPPConfig): OCPPClient {
+    const client = new OCPPClient();
+    try {
+      const resolved = resolveOCPPConfig(config);
+      const counters = client.counters;
+      // #redact stays undefined: OCPP frames are captured verbatim today.
+      const worker = new Worker(
+        new RingBuffer(resolved.maxBufferBytes, counters),
+        new Transport(resolved, counters),
+        resolved,
+        counters,
+      );
+      worker.start();
+      client.begin(worker);
+    } catch (err) {
+      const error =
+        err instanceof ConfigError
+          ? err
+          : new ConfigError(`@evpanda/sdk: ${String(err)}`);
+      client.fail(error, loggerFor(config));
+    }
+    return client;
   }
 }
 
-/** Encode a frame to bytes and signal overflow against the configured cap. */
-function encodeFrame(
-  data: Uint8Array | string,
-  max: number,
-): { payload: Uint8Array; overflowed: boolean } {
-  const buf =
-    data instanceof Uint8Array ? data : Buffer.from(data, "utf8");
-  if (buf.length > max) return { payload: new Uint8Array(0), overflowed: true };
-  return { payload: buf, overflowed: false };
+/**
+ * Validate the config, build the client, and start its background worker.
+ *
+ * It always returns a usable `OCPPClient` and never throws; see `startOCPI`
+ * for what can fail and what an inert client does.
+ *
+ * ```ts
+ * const panda = startOCPP();
+ * if (panda.error) log.warn(`${panda.error.message} (running inert)`);
+ * ```
+ */
+export function startOCPP(config: OCPPConfig = {}): OCPPClient {
+  return OCPPClient._build(config);
 }

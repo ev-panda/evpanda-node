@@ -1,299 +1,282 @@
-import http from "node:http";
-import type { AddressInfo } from "node:net";
-import { gunzipSync } from "node:zlib";
+/** End to end: capture on one side, decoded records on the other. */
 
-import { decompress as zstdDecompress } from "@mongodb-js/zstd";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-// E2E against the built artifact — exactly what ships.
-import { OCPIClient } from "../dist/index.js";
-import type { OCPIMessageInput } from "../dist/index.js";
+import { startOCPI } from "../src/index.js";
+import { BATCH_CAP } from "../src/worker.js";
+import {
+  CHARGER,
+  PARTNER,
+  exchange,
+  ocpiClient,
+  ocppClient,
+  startMockUpstream,
+} from "./helpers.js";
 
-/**
- * Node 18 leaves idle keep-alive sockets open, so `server.close()` blocks for
- * `keepAliveTimeout` (5s) after any undici/global-fetch request — long enough
- * to blow a test's 5s budget. Node 19+ drops idle connections itself.
- */
-function closeSockets(server: http.Server): void {
-  server.closeAllConnections?.();
-}
+import type { MockUpstream } from "./helpers.js";
 
+let mock: MockUpstream;
 
-// ── Mock upstream ────────────────────────────────────────────────────────
+beforeEach(async () => {
+  mock = await startMockUpstream();
+});
+afterEach(async () => {
+  await mock.close();
+});
 
-interface Received {
-  path: string;
-  headers: http.IncomingHttpHeaders;
-  records: Record<string, unknown>[];
-}
+const b64 = (v: unknown) => Buffer.from(String(v), "base64").toString("utf8");
 
-interface MockUpstream {
-  url: string;
-  received: Received[];
-  /** Mutable: change to make the upstream reject (e.g. 400). */
-  status: number;
-  close(): Promise<void>;
-}
-
-const startMockUpstream = (): Promise<MockUpstream> => {
-  const received: Received[] = [];
-  const mock = { received, status: 200 } as MockUpstream;
-
-  const server = http.createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => {
-      void (async () => {
-      let buf = Buffer.concat(chunks);
-      const enc = req.headers["content-encoding"];
-      if (enc === "gzip") buf = gunzipSync(buf);
-      else if (enc === "zstd") buf = await zstdDecompress(buf);
-      let records: Record<string, unknown>[] = [];
-      try {
-        const parsed: unknown = JSON.parse(buf.toString("utf8"));
-        // New wire contract: { "messages": [ <record>, ... ] }.
-        if (
-          parsed !== null &&
-          typeof parsed === "object" &&
-          Array.isArray((parsed as { messages?: unknown }).messages)
-        ) {
-          records = (parsed as { messages: Record<string, unknown>[] })
-            .messages;
-        }
-      } catch {
-        /* leave empty */
-      }
-      received.push({ path: req.url ?? "", headers: req.headers, records });
-      res.writeHead(mock.status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ captured: records.length, failed: 0 }));
-      })();
+describe("OCPI", () => {
+  it("delivers an inbound exchange intact", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({
+      identity: { ...PARTNER, tenantId: "t-1", tenantName: "Tenant One" },
+      data: exchange(),
     });
-  });
+    await panda.flush();
+    await panda.close();
 
-  return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address() as AddressInfo;
-      mock.url = `http://127.0.0.1:${port}`;
-      mock.close = () =>
-        new Promise<void>((r) => { server.close(() => r()); closeSockets(server); });
-      resolve(mock);
+    const [record] = await mock.waitFor(1);
+    expect(mock.received[0].path).toBe("/v1/ocpi");
+    expect(mock.received[0].headers["x-api-key"]).toBe("test-key");
+    expect(record).toMatchObject({
+      direction: "IN",
+      platform_id: "acme",
+      platform_name: "Acme Mobility",
+      tenant_id: "t-1",
+      tenant_name: "Tenant One",
+      http_method: "POST",
+      url: "/ocpi/2.2/cdrs",
+      response_status_code: 201,
     });
-  });
-};
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-async function waitFor(
-  predicate: () => boolean,
-  timeoutMs = 3000,
-  intervalMs = 20,
-): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-}
-
-/**
- * Valid OCPI message tagged with an index. Carries both an unsafe header
- * (`Authorization`, never on the OCPI allowlist) and one that *is* on the
- * default allowlist (`x-correlation-id`) so we can prove the policy from
- * both sides in one test.
- */
-const makeOCPI = (i: number): OCPIMessageInput => {
-  return {
-    identity: {
-      platformId: "acme",
-      platformName: "Acme Mobility",
-      tenantId: "t1",
-      tenantName: "Tenant One",
-    },
-    data: {
-      method: "POST",
-      url: `/ocpi/2.2/cdrs/${i}`,
-      statusCode: 200,
-      requestHeaders: {
-        Authorization: "Bearer SECRET",
-        "x-correlation-id": String(i),
-      },
-      responseHeaders: { "content-type": "application/json" },
-      requestBody: new TextEncoder().encode(`body-${i}`),
-    },
-  };
-};
-
-const ocpiRecords = (m: MockUpstream) =>
-  m.received
-    .filter((r) => r.path === "/v1/ocpi")
-    .flatMap((r) => r.records);
-
-// ── Tests ────────────────────────────────────────────────────────────────
-
-describe("OCPIClient e2e", () => {
-  let mock: MockUpstream;
-  let sdk: ReturnType<typeof OCPIClient.start> | undefined;
-
-  beforeEach(async () => {
-    mock = await startMockUpstream();
-    sdk = undefined;
+    expect(b64(record.request_body)).toBe('{"id":"cdr-1"}');
+    expect(String(record.captured_at)).toMatch(/Z$/);
   });
 
-  afterEach(async () => {
-    if (sdk) await sdk.close(); // idempotent
-    await mock.close();
+  it("stamps the direction from the method you call", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    panda.captureOutboundMessage({ identity: PARTNER, data: exchange() });
+    await panda.flush();
+    await panda.close();
+
+    const records = await mock.waitFor(2);
+    expect(records.map((r) => r.direction)).toEqual(["IN", "OUT"]);
   });
 
-  it("captures, batches on the timer, and the upstream receives all data (redacted & routed)", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "test-key",
-      flushInterval: 100,
+  it("never lets a secret reach the wire", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureOutboundMessage({
+      identity: PARTNER,
+      data: exchange({
+        url: "/ocpi/2.2/credentials",
+        requestHeaders: { Authorization: "Token super-secret", accept: "*/*" },
+        requestBody: Buffer.from(JSON.stringify({ token: "another-secret" })),
+      }),
     });
+    await panda.flush();
+    await panda.close();
 
-    for (let i = 0; i < 3; i++) sdk.captureInboundMessage(makeOCPI(i));
+    const [record] = await mock.waitFor(1);
+    expect(record.request_headers).toEqual({ accept: "*/*" });
+    expect(JSON.parse(b64(record.request_body))).toEqual({ token: "[redacted]" });
+  });
 
-    await waitFor(() => ocpiRecords(mock).length === 3);
+  it("serializes absent values as null", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({
+      identity: PARTNER,
+      data: { method: "GET", url: "/ocpi/2.2/versions" },
+    });
+    await panda.flush();
+    await panda.close();
 
-    const recs = ocpiRecords(mock).sort((a, b) =>
-      String(a.url).localeCompare(String(b.url)),
+    const [record] = await mock.waitFor(1);
+    expect(record.response_status_code).toBeNull();
+    expect(record.request_body).toBeNull();
+    expect(record.response_headers).toBeNull();
+    expect(record.tenant_id).toBeNull();
+  });
+});
+
+describe("OCPP", () => {
+  it("delivers a session as three events", async () => {
+    const panda = ocppClient(mock);
+    const session = panda.connection(CHARGER);
+    session.message('[2,"1","Heartbeat",{}]', "FROM_CP");
+    session.disconnect();
+    await panda.flush();
+    await panda.close();
+
+    const records = await mock.waitFor(3);
+    expect(mock.received[0].path).toBe("/v1/ocpp");
+    expect(records.map((r) => r.event_type)).toEqual([1, 2, 0]);
+    expect(records[1].direction).toBe("FROM_CP");
+    expect(b64(records[1].raw_frame)).toBe('[2,"1","Heartbeat",{}]');
+    expect(records[0].raw_frame).toBeNull();
+    expect(new Set(records.map((r) => r.connection_id)).size).toBe(1);
+  });
+
+  it("mints a fresh connection id per session", () => {
+    const panda = ocppClient(mock);
+    expect(panda.connection(CHARGER).connectionId).not.toBe(
+      panda.connection(CHARGER).connectionId,
     );
-    expect(recs).toHaveLength(3);
-
-    // Routing: only /v1/ocpi was hit, with the configured api key.
-    expect(mock.received.every((r) => r.path === "/v1/ocpi")).toBe(true);
-    expect(mock.received[0]?.headers["x-api-key"]).toBe("test-key");
-
-    recs.forEach((rec, i) => {
-      // No wire `protocol` field anymore.
-      expect(rec.protocol).toBeUndefined();
-
-      // Flat snake_case ingestion record.
-      expect(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
-          String(rec.captured_at),
-        ),
-      ).toBe(true);
-      expect(rec.platform_id).toBe("acme");
-      expect(rec.platform_name).toBe("Acme Mobility");
-      expect(rec.tenant_id).toBe("t1");
-      expect(rec.tenant_name).toBe("Tenant One");
-      expect(rec.direction).toBe("IN");
-      expect(rec.http_method).toBe("POST");
-      expect(rec.url).toBe(`/ocpi/2.2/cdrs/${i}`);
-      // response_status_code always present.
-      expect(rec.response_status_code).toBe(200);
-
-      // request_headers is a JSON object.
-      const reqHeaders = rec.request_headers as Record<string, string>;
-      expect(typeof reqHeaders).toBe("object");
-
-      // Redaction policy: allowlist drops Authorization (not on the list),
-      // keeps x-correlation-id (on the default OCPI allowlist).
-      const keys = Object.keys(reqHeaders).map((k) => k.toLowerCase());
-      expect(keys).not.toContain("authorization");
-      expect(reqHeaders["x-correlation-id"]).toBe(String(i));
-
-      // Binary body round-trips as base64.
-      expect(
-        Buffer.from(String(rec.request_body), "base64").toString("utf8"),
-      ).toBe(`body-${i}`);
-    });
+    void panda.close();
   });
+});
 
-  it("compresses large batches with gzip and chunks at BATCH_CAP, in order", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      compression: "gzip",
-      flushInterval: 100,
-      bufferCapacity: 100_000,
-    });
-
-    const N = 2500;
-    for (let i = 0; i < N; i++) sdk.captureInboundMessage(makeOCPI(i));
-
-    await waitFor(() => ocpiRecords(mock).length === N, 8000);
-
-    // Chunked at ≤1000 per POST → ceil(2500/1000) = 3 requests.
-    const posts = mock.received.filter((r) => r.path === "/v1/ocpi");
-    expect(posts).toHaveLength(3);
-    expect(posts.every((p) => p.records.length <= 1000)).toBe(true);
-
-    // Compression actually used (payload ≫ 1 KiB) and round-tripped.
-    expect(posts.every((p) => p.headers["content-encoding"] === "gzip")).toBe(
-      true,
-    );
-
-    // FIFO order preserved across the chunked POSTs.
-    ocpiRecords(mock).forEach((rec, i) => {
-      expect(rec.url).toBe(`/ocpi/2.2/cdrs/${i}`);
-    });
-  }, 15000);
-
-  it("caps the buffer at config.bufferCapacity (drop-oldest)", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      bufferCapacity: 5,
-      flushInterval: 60_000, // no auto flush during the test
-    });
-
-    for (let i = 0; i < 12; i++) sdk.captureInboundMessage(makeOCPI(i)); // 0..11
-    await sdk.flush(); // force one drain
-
-    await waitFor(() => ocpiRecords(mock).length === 5);
-    const urls = ocpiRecords(mock)
-      .map((r) => String(r.url))
-      .sort();
-    // Only the newest 5 survive (7..11); the oldest 7 were dropped.
-    expect(urls).toEqual([
-      "/ocpi/2.2/cdrs/10",
-      "/ocpi/2.2/cdrs/11",
-      "/ocpi/2.2/cdrs/7",
-      "/ocpi/2.2/cdrs/8",
-      "/ocpi/2.2/cdrs/9",
-    ]);
-  });
-
-  it("flushes all pending messages to the upstream on close()", async () => {
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 60_000, // never auto-flushes within the test
-    });
-
-    for (let i = 0; i < 4; i++) sdk.captureInboundMessage(makeOCPI(i));
-    expect(ocpiRecords(mock)).toHaveLength(0); // nothing sent yet
-
-    await sdk.close(); // graceful drain
-
-    await waitFor(() => ocpiRecords(mock).length === 4);
-    expect(ocpiRecords(mock)).toHaveLength(4);
-  });
-
-  it("never throws into the caller when the upstream fails", async () => {
-    mock.status = 400; // permanent reject → dropped, no retry storm
-    sdk = OCPIClient.start({
-      endpoint: mock.url,
-      apiKey: "k",
-      flushInterval: 60_000,
-    });
-
-    // Capture during a failing upstream — must not throw.
-    for (let i = 0; i < 3; i++) {
-      expect(() => sdk?.captureInboundMessage(makeOCPI(i))).not.toThrow();
+describe("delivery", () => {
+  it("flushes a full batch without waiting for the interval", async () => {
+    const panda = ocppClient(mock);
+    const session = panda.connection(CHARGER);
+    for (let i = 0; i < BATCH_CAP; i++) {
+      session.message('[2,"1","Heartbeat",{}]', "FROM_CP");
     }
-    // Malformed customer input — must not throw either (proxy swallows).
-    expect(() => sdk?.captureInboundMessage(undefined as never)).not.toThrow();
-    expect(() => sdk?.captureInboundMessage({} as never)).not.toThrow();
+    // No flush() call: the size trigger alone must deliver it.
+    expect((await mock.waitFor(BATCH_CAP)).length).toBeGreaterThanOrEqual(BATCH_CAP);
+    await panda.close();
+  });
 
-    // flush() resolves (never rejects) even though the upstream 400s.
-    await expect(sdk.flush()).resolves.toBeUndefined();
-    expect(mock.received.length).toBeGreaterThan(0); // it did attempt
+  it("chunks a large backlog at the batch cap", async () => {
+    const panda = ocppClient(mock);
+    const session = panda.connection(CHARGER);
+    for (let i = 0; i < BATCH_CAP + 500; i++) {
+      session.message('[2,"1","Heartbeat",{}]', "FROM_CP");
+    }
+    await panda.flush();
+    await panda.close();
 
-    // The SDK is still usable afterwards.
-    expect(() => sdk?.captureInboundMessage(makeOCPI(99))).not.toThrow();
-    await expect(sdk.flush()).resolves.toBeUndefined();
+    await mock.waitFor(BATCH_CAP + 501);
+    expect(mock.received.every((r) => r.records.length <= BATCH_CAP)).toBe(true);
+  });
+
+  it("delivers what was buffered on close", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    expect(await panda.close()).toBe(true);
+    expect(mock.records).toHaveLength(1);
+  });
+
+  it("flushes on the interval on its own", async () => {
+    const panda = ocpiClient(mock, { flushInterval: 20 });
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    expect((await mock.waitFor(1)).length).toBe(1);
+    await panda.close();
+  });
+
+  it("compresses a large body with zstd and leaves a small one alone", async () => {
+    const big = ocpiClient(mock);
+    for (let i = 0; i < 50; i++) {
+      big.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    }
+    await big.flush();
+    await big.close();
+    expect(mock.received[0].headers["content-encoding"]).toBe("zstd");
+
+    const small = ocpiClient(mock);
+    small.captureInboundMessage({
+      identity: PARTNER,
+      data: { method: "GET", url: "/v" },
+    });
+    await small.flush();
+    await small.close();
+    expect(mock.received[1].headers["content-encoding"]).toBeUndefined();
+  });
+
+  it("retries a transient failure", async () => {
+    mock.statuses.push(500, 503);
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    await panda.flush();
+    await panda.close();
+    expect(mock.records).toHaveLength(1);
+    expect(panda.stats().droppedUndeliverable).toBe(0);
+  }, 20_000);
+
+  it.each([400, 401, 413])("never retries a permanent %d", async (status) => {
+    mock.statuses.push(status);
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    await panda.flush();
+    await panda.close();
+    expect(mock.records).toHaveLength(0);
+    expect(panda.stats().droppedUndeliverable).toBe(1);
+  });
+});
+
+describe("the client", () => {
+  it("is inert, not broken, without an api key", async () => {
+    const panda = startOCPI({ endpoint: mock.url, logMode: "silent" });
+    expect(panda.error?.name).toBe("ApiKeyError");
+    expect(panda.capturing()).toBeUndefined();
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    await panda.flush();
+    expect(await panda.close()).toBe(true);
+    expect(panda.stats().captured).toBe(0);
+  });
+
+  it("counts what it drops, and keeps the tally after close", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    panda.captureInboundMessage({
+      identity: { id: "", name: "" },
+      data: exchange(),
+    });
+    panda.captureInboundMessage({
+      identity: PARTNER,
+      data: exchange({ requestBody: Buffer.alloc(70_000) }),
+    });
+    const live = panda.stats();
+    expect(live).toMatchObject({ captured: 1, droppedInvalid: 1, droppedOversize: 1 });
+    expect(live.bufferedMessages).toBe(1);
+
+    await panda.close();
+    const final = panda.stats();
+    expect(final.captured).toBe(1);
+    expect(final.droppedInvalid).toBe(1);
+    expect(final.bufferedMessages).toBe(0);
+  });
+
+  it("stops capturing after close, and close is idempotent", async () => {
+    const panda = ocpiClient(mock);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    expect(await panda.close()).toBe(true);
+    panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    expect(panda.capturing()).toBeUndefined();
+    expect(panda.stats().captured).toBe(1);
+    expect(await panda.close()).toBe(true);
+  });
+
+  it("survives an upstream that is simply not there", async () => {
+    const panda = startOCPI({
+      endpoint: "http://127.0.0.1:1",
+      apiKey: "k",
+      flushInterval: 3_600_000,
+      logMode: "silent",
+      drainTimeout: 5_000,
+    });
+    for (let i = 0; i < 10; i++) {
+      panda.captureInboundMessage({ identity: PARTNER, data: exchange() });
+    }
+    await panda.close(5_000);
+    expect(panda.stats().droppedUndeliverable).toBeGreaterThan(0);
+  }, 20_000);
+
+  it("evicts rather than growing past the buffer budget", async () => {
+    const panda = ocpiClient(mock, {
+      maxBufferBytes: 64 * 1024,
+      maxCaptureBytes: 1024,
+    });
+    for (let i = 0; i < 500; i++) {
+      panda.captureInboundMessage({
+        identity: PARTNER,
+        data: exchange({ requestBody: Buffer.alloc(512) }),
+      });
+    }
+    const stats = panda.stats();
+    expect(stats.bufferBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(stats.droppedEvicted).toBeGreaterThan(0);
+    await panda.close();
   });
 });

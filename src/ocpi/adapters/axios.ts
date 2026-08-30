@@ -17,8 +17,9 @@
 
 import {
   IDENTITY_HEADER_NAMES,
-  headerResolver,
-  safeResolve,
+  capturing,
+  currentIdentity,
+  resolve as resolveIdentity,
 } from "./resolver.js";
 
 import type {
@@ -27,10 +28,8 @@ import type {
   AxiosResponse,
   InternalAxiosRequestConfig,
 } from "axios";
-import type { Logger } from "../../config.js";
-import type { OCPIResolver, RoamingIdentity } from "../../identity.js";
-import type { OCPIClient } from "../client.js";
-import type { HttpExchange } from "../../types.js";
+import type { Capturer, OCPIResolver } from "./resolver.js";
+import type { HTTPExchange, Platform } from "../../types.js";
 
 export interface OCPIAxiosOptions {
   /**
@@ -43,7 +42,7 @@ export interface OCPIAxiosOptions {
 /** Carried on `config` from request → response so capture can re-assemble. */
 const STASH = Symbol("evpanda.axios.stash");
 interface Stash {
-  identity: RoamingIdentity;
+  identity: Platform;
   requestBody?: Uint8Array;
   /** Set when `config.data` already exceeded the cap at request time. */
   reqOverflowed: boolean;
@@ -56,41 +55,40 @@ type ConfigWithStash = InternalAxiosRequestConfig & { [STASH]?: Stash };
  * not removed interceptors in between — we do not deduplicate.
  */
 export function axios(
-  sdk: OCPIClient,
+  sdk: Capturer,
   instance: AxiosInstance,
   opts: OCPIAxiosOptions = {},
 ): AxiosInstance {
-  const bridge = sdk._internal;
-  // Inert SDK: skip both interceptors entirely — zero overhead per call.
-  if (!bridge) return instance;
-
-  const { maxCaptureBytes, logger } = bridge;
-  const { resolve = headerResolver } = opts;
+  // An inert client skips both interceptors entirely — zero overhead per
+  // call.
+  if (capturing(sdk) === undefined) return instance;
 
   instance.interceptors.request.use((config) => {
-    // Interceptors can't be unregistered, so a closed client is skipped here.
-    if (!sdk._internal) return config;
-    try {
-      const identity: RoamingIdentity | undefined = safeResolve(resolve, {
-        method: (config.method ?? "get").toUpperCase(),
-        url: safeGetUri(instance, config),
-        requestHeaders: axiosHeadersToRecord(config.headers),
-      });
-      if (identity) {
-        const r = bodyToBytes(config.data, maxCaptureBytes);
-        (config as ConfigWithStash)[STASH] = {
-          identity,
-          requestBody: r.body,
-          reqOverflowed: r.overflowed,
-        };
+    // Interceptors cannot be unregistered, so a closed client is skipped
+    // here instead.
+    const maxCaptureBytes = capturing(sdk);
+    if (maxCaptureBytes !== undefined) {
+      try {
+        const identity = resolveIdentity(opts.resolve, {
+          method: (config.method ?? "get").toUpperCase(),
+          url: safeGetUri(instance, config),
+          requestHeaders: axiosHeadersToRecord(config.headers),
+          identity: currentIdentity(),
+          context: config,
+        });
+        if (identity) {
+          const r = bodyToBytes(config.data, maxCaptureBytes);
+          (config as ConfigWithStash)[STASH] = {
+            identity,
+            requestBody: r.body,
+            reqOverflowed: r.overflowed,
+          };
+        }
+      } catch {
+        /* never block the outgoing request */
       }
-    } catch (err) {
-      // never block the outgoing request
-      logger?.warn("@evpanda/sdk: OCPI axios request hook failed", {
-        error: String(err),
-      });
     }
-    // Outside the try: strip even when resolution failed, so the identity
+    // Outside the guard: strip even when resolution failed, so the identity
     // headers can never reach the partner.
     stripIdentityHeaders(config.headers);
     return config;
@@ -98,16 +96,18 @@ export function axios(
 
   instance.interceptors.response.use(
     (response) => {
-      if (sdk._internal) {
-        tryEmit(sdk, instance, response.config, response, maxCaptureBytes, logger);
+      const maxCaptureBytes = capturing(sdk);
+      if (maxCaptureBytes !== undefined) {
+        tryEmit(sdk, instance, response.config, response, maxCaptureBytes);
       }
       return response;
     },
     (error: AxiosError) => {
       // Only capture when the partner responded (non-2xx). Pass
-      // `error.config` explicitly — don't mutate the customer's error.
-      if (sdk._internal && error.response && error.config) {
-        tryEmit(sdk, instance, error.config, error.response, maxCaptureBytes, logger);
+      // `error.config` explicitly — do not mutate the customer's error.
+      const maxCaptureBytes = capturing(sdk);
+      if (maxCaptureBytes !== undefined && error.response && error.config) {
+        tryEmit(sdk, instance, error.config, error.response, maxCaptureBytes);
       }
       return Promise.reject(error);
     },
@@ -118,12 +118,11 @@ export function axios(
 
 /** Read stash + assemble + emit. Any fault is swallowed (logged in debug). */
 function tryEmit(
-  sdk: OCPIClient,
+  sdk: Capturer,
   instance: AxiosInstance,
   config: InternalAxiosRequestConfig,
   response: AxiosResponse,
   maxCaptureBytes: number,
-  logger: Logger | undefined,
 ): void {
   try {
     const stash = (config as ConfigWithStash)[STASH];
@@ -132,7 +131,7 @@ function tryEmit(
     if (stash.reqOverflowed) return;
     const resp = bodyToBytes(response.data, maxCaptureBytes);
     if (resp.overflowed) return;
-    const data: HttpExchange = {
+    const data: HTTPExchange = {
       method: (config.method ?? "get").toUpperCase(),
       url: safeGetUri(instance, config),
       statusCode: response.status,
@@ -142,10 +141,8 @@ function tryEmit(
       responseBody: resp.body,
     };
     sdk.captureOutboundMessage({ identity: stash.identity, data });
-  } catch (err) {
-    logger?.warn("@evpanda/sdk: OCPI axios capture failed", {
-      error: String(err),
-    });
+  } catch {
+    /* a capture fault never reaches the caller */
   }
 }
 

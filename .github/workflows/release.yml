@@ -1,59 +1,127 @@
-# Publishes @evpanda/sdk to npm when a GitHub Release is published.
+# Publishes @evpanda/sdk to npm when a semver tag is pushed, and cuts the
+# matching GitHub Release.
+#
+# To release:
+#   1. bump "version" in package.json, and merge it
+#   2. git tag v0.3.0 && git push origin v0.3.0
+#
+# The tag is the trigger, so the version in the tree and the version in the
+# tag cannot drift — validate-tag fails the release if they disagree. npm
+# rejects re-publishing an existing version, so a bump is not optional.
 #
 # Prerequisites (one-time):
-#   - Repo secret NPM_TOKEN: an npm automation token with publish rights
-#     to the @evpanda scope.
-#   - Bump "version" in package.json before tagging; npm rejects
-#     re-publishing an existing version.
+#   - Repo secret NPM_TOKEN: an npm automation token with publish rights to
+#     the @evpanda scope.
 #
-# npm publishes with provenance (supply-chain attestation) — needs
-# id-token: write and a public scoped package (--access public).
-
+# npm publishes with provenance (a supply-chain attestation), which needs
+# id-token: write and a public scoped package.
 name: Release
 
 on:
-  release:
-    types: [published]
-  # Manual run from the Actions tab (publishes the version in package.json;
-  # npm rejects re-publishing an existing version, so bump it first).
-  workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
-    name: Publish
+  validate-tag:
+    name: Validate tag
     runs-on: ubuntu-latest
     steps:
-      # Fail fast (before checkout/install/test) if the publish token is
-      # missing — secrets can't be used in a job-level `if`, so guard here.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag is a semver version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$TAG' is not a release version (want vX.Y.Z or vX.Y.Z-pre)"
+            exit 1
+          fi
+
+      - name: Check the tag matches package.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if [ "$version" != "${TAG#v}" ]; then
+            echo "::error::package.json is $version but the tag is $TAG — bump one of them"
+            exit 1
+          fi
+          echo "package.json ($version) matches $TAG"
+
+      - name: Check the tag is on master
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master:refs/remotes/origin/master
+          if ! git merge-base --is-ancestor "$TAG" origin/master; then
+            echo "::error::$TAG is not an ancestor of master — release from master only"
+            exit 1
+          fi
+
       - name: Require NPM_TOKEN
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "$NPM_TOKEN" ]; then
-            echo "::error::NPM_TOKEN secret is not set — cannot publish. Add it in Settings → Secrets and variables → Actions."
+            echo "::error::NPM_TOKEN is not set — add it in Settings → Secrets and variables → Actions."
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+  # The same gate a pull request clears, re-run against the tagged commit.
+  checks:
+    needs: validate-tag
+    uses: ./.github/workflows/checks.yml
 
-      - uses: actions/setup-node@v4
+  publish:
+    name: Publish to npm
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
       - run: npm install --no-audit --no-fund
 
-      - run: npm run lint
-
-      - run: npm run typecheck
-
-      - run: npm test
-
       # prepublishOnly (build) runs automatically before publish.
       - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    name: Create the GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Pre-1.0 and pre-release tags are marked as such so consumers are
+          # not told an unstable version is the latest stable one.
+          flags=(--generate-notes --title "$TAG")
+          case "$TAG" in
+            v0.*|*-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" "${flags[@]}"

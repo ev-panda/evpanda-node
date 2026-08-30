@@ -1,7 +1,7 @@
 {
   "name": "@evpanda/sdk",
-  "version": "0.1.0",
-  "description": "EVPanda SDK — passive OCPI/OCPP traffic capture for embedding in customer OCPI servers and OCPP CSMS.",
+  "version": "0.3.0",
+  "description": "Passive OCPI / OCPP traffic capture for Node.",
   "keywords": [
     "ocpi",
     "ocpp",
@@ -17,15 +17,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ev-panda/evpanda-node.git"
+    "url": "git+https://github.com/evpanda-labs/evpanda-node.git"
   },
   "bugs": {
-    "url": "https://github.com/ev-panda/evpanda-node/issues"
+    "url": "https://github.com/evpanda-labs/evpanda-node/issues"
   },
-  "homepage": "https://github.com/ev-panda/evpanda-node#readme",
+  "homepage": "https://github.com/evpanda-labs/evpanda-node#readme",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.15.0"
   },
   "sideEffects": false,
   "main": "./dist/index.cjs",
@@ -54,17 +54,15 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "npm run build && vitest run test/e2e.test.ts",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
-    "@mongodb-js/zstd": "^7.0.0",
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.0.0",
     "axios": "^1.16.1",
     "eslint": "^9.39.4",
     "tsup": "^8.0.0",
@@ -73,7 +71,6 @@
     "vitest": "^1.6.0"
   },
   "peerDependencies": {
-    "@mongodb-js/zstd": ">=2.0.0",
     "axios": ">=1.0.0",
     "express": "*",
     "ws": "*"
@@ -83,9 +80,6 @@
     "provenance": true
   },
   "peerDependenciesMeta": {
-    "@mongodb-js/zstd": {
-      "optional": true
-    },
     "axios": {
       "optional": true
     },

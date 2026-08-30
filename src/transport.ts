@@ -1,43 +1,60 @@
 /**
- * Hand-rolled transport over Node 18+ global fetch. Body: JSON; zstd by
- * default, gzip when configured, identity for tiny payloads. Owns the
- * bounded retry: 200 or 400/401/413 → done; 5xx/network → backoff; the
- * caller never retries. Never throws.
+ * Hand-rolled transport over global `fetch`.
  *
- * The actual `POST /v1/{protocol}` lives in `Transport._post` — no
- * generated client (it would pull heavy transitive deps into customer
- * production for two endpoints) and no separate wrapper class.
+ * Body: JSON, zstd-compressed above a size floor. It owns the bounded
+ * retry — 200 or 400/401/413 is terminal, 5xx and network errors back off;
+ * the caller never retries. It never throws.
+ *
+ * The `POST /v1/{protocol}` call lives in `Transport._post`. No generated
+ * client, which would pull heavy transitive dependencies into customer
+ * production for two endpoints, and no HTTP library: `fetch` is global from
+ * Node 18 on.
  */
 
-import { gzip } from "node:zlib";
+import { zstdCompress } from "node:zlib";
 import { promisify } from "node:util";
+
+import { isOCPI } from "./types.js";
 
 import type { BufferedMessage } from "./buffer.js";
 import type { Logger, ResolvedConfig } from "./config.js";
+import type { Counters } from "./stats.js";
 import type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";
 
-const gzipAsync = promisify(gzip);
-
-// ── zstd — optional ──────────────────────────────────────────────────────
+// ── Compression ──────────────────────────────────────────────────────────
 //
-// `@mongodb-js/zstd` is a native addon and an optional peer dependency,
-// loaded lazily; absent ⇒ gzip fallback. So the SDK has no hard runtime dep.
+// zstd is the codec, and it is in the standard library: `node:zlib` gained
+// zstd in Node 22.15, which is why the engines floor is what it is. Every
+// EVPanda SDK compresses the same way, so a batch on the wire looks the
+// same whichever language sent it, and the ingestion API's capacity
+// planning holds across all of them. (It also accepts gzip and
+// uncompressed bodies; neither is used.)
+//
+// An earlier revision reached for `@mongodb-js/zstd`, a native addon, as an
+// optional peer with a gzip fallback. Node made both the dependency and the
+// fallback unnecessary.
 
-/** Local shape of zstd's `compress`, so nothing statically imports the package. */
-type ZstdCompress = (data: Buffer) => Promise<Buffer>;
+const zstd = promisify(zstdCompress);
 
-/** undefined = not tried yet · null = unavailable · fn = loaded. */
-let zstdCompress: ZstdCompress | null | undefined;
+type ContentEncoding = "identity" | "zstd";
 
-/** Resolve the zstd compressor once; null when the optional peer is absent. */
-async function loadZstd(): Promise<ZstdCompress | null> {
-  if (zstdCompress !== undefined) return zstdCompress;
+/** Below this raw size compression is not worth the CPU; send as-is. */
+const COMPRESS_MIN_BYTES = 1024;
+
+/**
+ * Encode the body with zstd, above the size floor. An uncompressed body is
+ * always a safe answer — the ingestion API accepts one — so a codec fault
+ * degrades to identity rather than costing us the batch.
+ */
+async function compress(
+  raw: Uint8Array,
+): Promise<[Uint8Array, ContentEncoding]> {
+  if (raw.byteLength < COMPRESS_MIN_BYTES) return [raw, "identity"];
   try {
-    zstdCompress = (await import("@mongodb-js/zstd")).compress;
+    return [await zstd(raw), "zstd"];
   } catch {
-    zstdCompress = null; // optional peer not installed — gzip is used instead
+    return [raw, "identity"];
   }
-  return zstdCompress;
 }
 
 // ── Backoff (module-private, fixed by design — not configurable) ─────────
@@ -58,10 +75,8 @@ function nextDelay(attempt: number): number {
 /** Per-attempt request cap so a hung connection still feeds the backoff. */
 const REQUEST_TIMEOUT_MS = 30_000;
 
-type ContentEncoding = "identity" | "gzip" | "zstd";
-
-/** Below this raw size, compression isn't worth the CPU; send identity. */
-const COMPRESS_MIN_BYTES = 1024;
+/** The statuses the ingestion contract defines as permanent. */
+const PERMANENT_STATUSES = new Set([400, 401, 413]);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -119,9 +134,9 @@ function headersJSON(
  * UTF-8 for OCPP, raw bytes for OCPI). Rationale: keeps the wire contract
  * uniform across protocols and binary-safe for any future payload.
  */
-function bodyB64(b: Uint8Array | undefined): string | null {
-  if (b === undefined || b.byteLength === 0) return null;
-  return Buffer.from(b).toString("base64");
+function bodyB64(b: Uint8Array | string | undefined): string | null {
+  if (b === undefined || b.length === 0) return null;
+  return Buffer.from(b as Uint8Array).toString("base64");
 }
 
 /** Non-empty string, or null. */
@@ -134,17 +149,13 @@ function optInt(n: number | undefined): number | null {
   return n === undefined || n === 0 ? null : n;
 }
 
-function isOCPI(m: OCPIMessage | OCPPMessage): m is OCPIMessage {
-  return "data" in m;
-}
-
 function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
   return {
     captured_at: e.capturedAt,
-    platform_id: m.identity.platformId,
-    platform_name: m.identity.platformName,
-    tenant_id: optStr(m.identity.tenantId),
-    tenant_name: optStr(m.identity.tenantName),
+    platform_id: m.platform.id,
+    platform_name: m.platform.name,
+    tenant_id: optStr(m.platform.tenantId),
+    tenant_name: optStr(m.platform.tenantName),
     direction: m.direction,
     http_method: m.data.method,
     url: m.data.url,
@@ -158,10 +169,10 @@ function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
 
 function ocppRecord(e: BufferedMessage, m: OCPPMessage): OcppIngest {
   return {
-    charger_id: m.identity.chargerId,
+    charger_id: m.charger.id,
     connection_id: m.connectionId,
-    tenant_id: optStr(m.identity.tenantId),
-    tenant_name: optStr(m.identity.tenantName),
+    tenant_id: optStr(m.charger.tenantId),
+    tenant_name: optStr(m.charger.tenantName),
     captured_at: e.capturedAt,
     event_type: m.eventType,
     direction: optStr(m.direction),
@@ -187,31 +198,102 @@ function serialize(batch: BufferedMessage[]): Uint8Array {
 export class Transport {
   private readonly _endpoint: string;
   private readonly _apiKey: string;
-  private readonly _compression: "gzip" | "zstd";
   /** Records dropped batches; undefined means silent. */
   private readonly _logger: Logger | undefined;
+  private readonly _debug: boolean;
 
-  constructor(config: ResolvedConfig) {
+  constructor(
+    config: ResolvedConfig,
+    private readonly _counters: Counters,
+  ) {
     this._endpoint = config.endpoint;
     this._apiKey = config.apiKey;
-    this._compression = config.compression;
     this._logger = config.logger;
+    this._debug = config.logMode === "debug";
   }
 
-  /** Records a dropped batch when the debug logger is configured. */
-  private _logDrop(protocol: Protocol, n: number, reason: string): void {
-    this._logger?.warn("@evpanda/sdk: dropped batch (delivery failed)", {
+  /**
+   * Serialize, compress and POST the batch with bounded retry.
+   *
+   * 200 or 400/401/413 is terminal; 5xx and network errors back off and
+   * retry. A batch that cannot be delivered is dropped — loss is acceptable
+   * by design, and the alternative is unbounded memory in the host.
+   *
+   * `deadline` is a `Date.now()` value past which no further attempt is
+   * started, so a shutdown drain cannot outlive the timeout the caller gave
+   * it. Never throws.
+   */
+  async send(
+    protocol: Protocol,
+    batch: BufferedMessage[],
+    deadline?: number,
+  ): Promise<void> {
+    if (batch.length === 0) return;
+    const size = batch.length;
+
+    let body: Uint8Array;
+    let encoding: ContentEncoding;
+    try {
+      [body, encoding] = await compress(serialize(batch));
+    } catch {
+      this._logDrop(protocol, size, "batch could not be serialized");
+      return;
+    }
+
+    let lastStatus = 0;
+    for (let attempt = 0; attempt < BACKOFF_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        const delay = nextDelay(attempt);
+        if (deadline !== undefined && Date.now() + delay >= deadline) {
+          this._logDrop(protocol, size, "deadline passed before retry");
+          return;
+        }
+        await sleep(delay);
+      }
+
+      const timeout = this._attemptTimeout(deadline);
+      if (timeout <= 0) {
+        this._logDrop(protocol, size, "deadline passed before delivery");
+        return;
+      }
+
+      let status: number;
+      try {
+        status = await this._post(protocol, body, encoding, timeout);
+      } catch {
+        lastStatus = 0;
+        continue; // network error or timeout: retryable
+      }
+      lastStatus = status;
+
+      if (status === 200) return;
+      if (PERMANENT_STATUSES.has(status)) {
+        this._logDrop(protocol, size, `permanent rejection: HTTP ${status}`);
+        return;
+      }
+    }
+
+    this._logDrop(
       protocol,
-      messages: n,
-      reason,
-    });
+      size,
+      lastStatus !== 0
+        ? `retries exhausted (last HTTP ${lastStatus})`
+        : "retries exhausted (network error / timeout)",
+    );
   }
 
-  /** Single POST /v1/{protocol}; drains the body, returns the status. */
+  /** The per-attempt timeout, never past the caller's deadline. */
+  private _attemptTimeout(deadline: number | undefined): number {
+    if (deadline === undefined) return REQUEST_TIMEOUT_MS;
+    return Math.min(REQUEST_TIMEOUT_MS, deadline - Date.now());
+  }
+
+  /** Issue one POST, drain the response, and return the status code. */
   private async _post(
     protocol: Protocol,
     body: Uint8Array,
     encoding: ContentEncoding,
+    timeout: number,
   ): Promise<number> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -223,86 +305,31 @@ export class Transport {
       method: "POST",
       headers,
       body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeout),
     });
-    await res.text(); // drain so the socket can be released; body unused
+    await res.text(); // drain so the socket can be released; the body is unused
     return res.status;
   }
 
   /**
-   * Encode with the configured codec — identity for tiny payloads, gzip if
-   * zstd is requested but its optional peer is absent, identity on failure.
+   * Count a dropped batch, and log it per-occurrence only in debug.
+   *
+   * In the default mode the worker's once-a-minute health line reports the
+   * same loss with bounded volume — an outage would otherwise emit a line
+   * every flush interval, for as long as it lasts, across every client at
+   * once.
    */
-  private async _compress(
-    raw: Uint8Array,
-  ): Promise<{ body: Uint8Array; encoding: ContentEncoding }> {
-    if (raw.byteLength < COMPRESS_MIN_BYTES) {
-      return { body: raw, encoding: "identity" };
-    }
+  private _logDrop(protocol: Protocol, n: number, reason: string): void {
+    this._counters.countDrop("undeliverable", n);
+    if (this._logger === undefined || !this._debug) return;
     try {
-      if (this._compression === "zstd") {
-        const zstd = await loadZstd();
-        if (zstd) {
-          return { body: await zstd(Buffer.from(raw)), encoding: "zstd" };
-        }
-        // zstd requested but the optional peer is absent — fall through to gzip.
-      }
-      return { body: await gzipAsync(raw), encoding: "gzip" };
+      this._logger.warn("@evpanda/sdk: dropped batch (delivery failed)", {
+        protocol,
+        messages: n,
+        reason,
+      });
     } catch {
-      return { body: raw, encoding: "identity" };
+      /* a broken host logger is not our failure */
     }
-  }
-
-  /**
-   * Serialize → compress → POST with internal bounded retry. 200 is
-   * success; 400/401/413 is a permanent drop; 5xx/network errors back off
-   * and retry; a batch that can't be delivered is dropped. Never throws.
-   */
-  async send(protocol: Protocol, batch: BufferedMessage[]): Promise<void> {
-    if (batch.length === 0) return;
-
-    let body: Uint8Array;
-    let encoding: ContentEncoding;
-    try {
-      ({ body, encoding } = await this._compress(serialize(batch)));
-    } catch {
-      return; // unserializable batch is dropped
-    }
-
-    let lastStatus = 0;
-    for (let attempt = 0; attempt < BACKOFF_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 0) await sleep(nextDelay(attempt));
-
-      let status: number;
-      try {
-        status = await this._post(protocol, body, encoding);
-      } catch {
-        lastStatus = 0;
-        continue; // network error / timeout → retryable
-      }
-      lastStatus = status;
-
-      // 200 accepted; 400/401/413 permanent (drop, never retry — only these
-      // three per the ingestion contract); any other non-2xx → retryable.
-      if (status === 200) {
-        return;
-      }
-      if (status === 400 || status === 401 || status === 413) {
-        this._logDrop(
-          protocol,
-          batch.length,
-          `permanent rejection: HTTP ${status}`,
-        );
-        return;
-      }
-    }
-    // retries exhausted → batch dropped (loss acceptable by design)
-    this._logDrop(
-      protocol,
-      batch.length,
-      lastStatus !== 0
-        ? `retries exhausted (last HTTP ${lastStatus})`
-        : "retries exhausted (network error / timeout)",
-    );
   }
 }
