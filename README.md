@@ -184,13 +184,13 @@ If identity lives somewhere else entirely — a client certificate, a path prefi
 — pass your own resolver:
 
 ```ts
-const byPath: ocpi.OCPIResolver = (info) => {
+const byPath: ocpi.Resolver = (info) => {
   if (!info.url.startsWith("/partners/")) return undefined; // not captured
   const name = info.url.split("/")[2];
   return { id: name, name };
 };
 
-app.use(ocpi.express(panda, { resolve: byPath }));
+app.use(ocpi.express(panda, { resolver: byPath }));
 ```
 
 ## Identity
@@ -261,7 +261,7 @@ The SDK reports problems to your logger by default, at a bounded rate: at most
 one summary line per minute, and nothing at all while it's healthy.
 
 ```
-@evpanda/sdk: captures dropped window=60s captured=12 droppedInvalid=148302 buffered=0 bufferBytes=0
+evpanda: captures dropped window=60s captured=12 invalid_identity=148302 buffered=0 buffer_bytes=0
 ```
 
 Set `logMode` to change that, or `EVPANDA_LOG=silent|errors|debug` to change it
@@ -320,7 +320,9 @@ a request path.
 ## Documentation
 
 - [Architecture and design notes](https://claude.ai/code/artifact/f214c278-cafd-409e-b1ab-b6a7fb8e7ece)
-  — how it works, and why. The source lives at [`docs/design.html`](docs/design.html)
+  — how it works, and why. The source lives in the Obsidian vault at
+  `engineering/SDKs/design-docs/`, not in this repo: it is knowledge
+  about the code rather than part of what ships
 - [evpanda-go](https://github.com/evpanda-labs/evpanda-go) — the reference
   implementation this SDK tracks
 - [evpanda-py](https://github.com/evpanda-labs/evpanda-py) — the Python SDK,

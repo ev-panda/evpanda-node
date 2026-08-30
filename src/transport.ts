@@ -323,7 +323,7 @@ export class Transport {
     this._counters.countDrop("undeliverable", n);
     if (this._logger === undefined || !this._debug) return;
     try {
-      this._logger.warn("@evpanda/sdk: dropped batch (delivery failed)", {
+      this._logger.warn("evpanda: dropped batch (delivery failed)", {
         protocol,
         messages: n,
         reason,

@@ -111,7 +111,7 @@ describe("the express adapter", () => {
 
     expect(res.status).toBe(201);
     expect(client.inbound).toHaveLength(1);
-    const { identity, data } = client.inbound[0];
+    const { identity, data } = client.inbound[0]!;
     expect(identity).toEqual(PARTNER);
     expect(data.method).toBe("POST");
     expect(data.url).toBe("/ocpi/2.2/cdrs");
@@ -149,11 +149,12 @@ describe("the express adapter", () => {
 
   it("takes a resolver of your own", async () => {
     const client = new Fake();
-    const byPath: ocpi.OCPIResolver = (info) =>
-      info.url.startsWith("/partners/")
-        ? { id: info.url.split("/")[2], name: info.url.split("/")[2] }
-        : undefined;
-    host = await startHost([ocpi.express(client, { resolve: byPath }), echo]);
+    const byPath: ocpi.Resolver = (info) => {
+      if (!info.url.startsWith("/partners/")) return undefined;
+      const name = info.url.split("/")[2] ?? "";
+      return { id: name, name };
+    };
+    host = await startHost([ocpi.express(client, { resolver: byPath }), echo]);
 
     await (await fetch(`${host.url}/partners/acme/cdrs`)).text();
     await (await fetch(`${host.url}/health`)).text();
@@ -202,7 +203,7 @@ describe("the fetch adapter", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(client.outbound).toHaveLength(1);
-    const { identity, data } = client.outbound[0];
+    const { identity, data } = client.outbound[0]!;
     expect(identity).toEqual(PARTNER);
     expect(data.method).toBe("POST");
     expect(data.statusCode).toBe(200);
@@ -269,8 +270,8 @@ describe("the axios adapter", () => {
 
     expect(res.status).toBe(201);
     expect(client.outbound).toHaveLength(1);
-    expect(client.outbound[0].identity).toEqual(PARTNER);
-    expect(client.outbound[0].data.statusCode).toBe(201);
+    expect(client.outbound[0]!.identity).toEqual(PARTNER);
+    expect(client.outbound[0]!.data.statusCode).toBe(201);
   });
 
   it("strips the identity headers before dispatch", async () => {

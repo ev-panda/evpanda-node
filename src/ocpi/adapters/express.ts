@@ -21,7 +21,7 @@ import {
 } from "./resolver.js";
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Capturer, OCPIResolver } from "./resolver.js";
+import type { Capturer, Resolver } from "./resolver.js";
 import type { HTTPExchange } from "../../types.js";
 
 export interface OCPIExpressOptions {
@@ -30,7 +30,7 @@ export interface OCPIExpressOptions {
    * first (see `setIdentity`), then the `useIdentity` scope, then the
    * `X-EVPanda-*` headers.
    */
-  resolve?: OCPIResolver;
+  resolver?: Resolver;
 }
 
 type Next = (err?: unknown) => void;
@@ -64,7 +64,7 @@ export function express(
       next();
       return;
     }
-    instrument(sdk, req, res, maxCaptureBytes, opts.resolve);
+    instrument(sdk, req, res, maxCaptureBytes, opts.resolver);
     next();
   };
 }
@@ -79,7 +79,7 @@ function instrument(
   req: IncomingMessage,
   res: ServerResponse,
   maxCaptureBytes: number,
-  resolver: OCPIResolver | undefined,
+  resolver: Resolver | undefined,
 ): void {
   try {
     const resBody: CappedBody = { chunks: [], len: 0, overflowed: false };

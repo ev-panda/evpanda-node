@@ -173,7 +173,7 @@ export class OCPPClient extends BaseClient {
       const error =
         err instanceof ConfigError
           ? err
-          : new ConfigError(`@evpanda/sdk: ${String(err)}`);
+          : new ConfigError(`evpanda: ${String(err)}`);
       client.fail(error, loggerFor(config));
     }
     return client;

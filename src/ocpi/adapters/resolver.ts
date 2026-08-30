@@ -76,20 +76,25 @@ export const IDENTITY_KEY = "evpandaIdentity";
  * wire. The names carry `Platform.id`, `Platform.name`, `Platform.tenantId`
  * and `Platform.tenantName`.
  */
-export const IDENTITY_HEADERS = {
-  id: "x-evpanda-platform-id",
-  name: "x-evpanda-platform-name",
-  tenantId: "x-evpanda-tenant-id",
-  tenantName: "x-evpanda-tenant-name",
-} as const;
+export const HEADER_PLATFORM_ID = "x-evpanda-platform-id";
+export const HEADER_PLATFORM_NAME = "x-evpanda-platform-name";
+export const HEADER_TENANT_ID = "x-evpanda-tenant-id";
+export const HEADER_TENANT_NAME = "x-evpanda-tenant-name";
 
 /**
- * The same names as a list. The outbound adapters strip these before
+ * The same four names as a list. The outbound adapters strip these before
  * dispatch — `tenantId` and `tenantName` in particular describe your own
  * tenant, not the partner's.
+ *
+ * The constants and this list are named to match the Go and Python SDKs,
+ * so the same identifier means the same thing in all three.
  */
-export const IDENTITY_HEADER_NAMES: readonly string[] =
-  Object.values(IDENTITY_HEADERS);
+export const IDENTITY_HEADERS: readonly string[] = [
+  HEADER_PLATFORM_ID,
+  HEADER_PLATFORM_NAME,
+  HEADER_TENANT_ID,
+  HEADER_TENANT_NAME,
+];
 
 const scope = new AsyncLocalStorage<Platform>();
 
@@ -152,12 +157,12 @@ export function identityFromHeaders(
     const v = headers[key]?.trim();
     return v === undefined || v === "" ? undefined : v;
   };
-  const id = read(IDENTITY_HEADERS.id);
-  const name = read(IDENTITY_HEADERS.name);
+  const id = read(HEADER_PLATFORM_ID);
+  const name = read(HEADER_PLATFORM_NAME);
   if (id === undefined && name === undefined) return undefined;
   const platform: Platform = { id: id ?? "", name: name ?? "" };
-  const tenantId = read(IDENTITY_HEADERS.tenantId);
-  const tenantName = read(IDENTITY_HEADERS.tenantName);
+  const tenantId = read(HEADER_TENANT_ID);
+  const tenantName = read(HEADER_TENANT_NAME);
   if (tenantId !== undefined) platform.tenantId = tenantId;
   if (tenantName !== undefined) platform.tenantName = tenantName;
   return platform;
@@ -201,7 +206,7 @@ export interface RequestInfo {
  * is not captured; the request itself is never blocked or altered because
  * of it.
  */
-export type OCPIResolver = (info: RequestInfo) => Platform | undefined;
+export type Resolver = (info: RequestInfo) => Platform | undefined;
 
 /**
  * What every adapter uses when no resolver is configured: the request
@@ -209,7 +214,7 @@ export type OCPIResolver = (info: RequestInfo) => Platform | undefined;
  * headers. A request carrying none of the three is simply not captured —
  * no error, no partial record.
  */
-export const defaultResolver: OCPIResolver = (info) =>
+export const defaultResolver: Resolver = (info) =>
   info.identity ?? currentIdentity() ?? identityFromHeaders(info.requestHeaders);
 
 /**
@@ -218,7 +223,7 @@ export const defaultResolver: OCPIResolver = (info) =>
  * the same thing: skip capture for this request.
  */
 export function resolve(
-  resolver: OCPIResolver | undefined,
+  resolver: Resolver | undefined,
   info: RequestInfo,
 ): Platform | undefined {
   let identity: Platform | undefined;

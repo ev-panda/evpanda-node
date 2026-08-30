@@ -55,8 +55,6 @@ export type { Stats } from "./stats.js";
 export type { OCPIMessageInput } from "./ocpi/client.js";
 export type { OCPPMessageInput, OCPPSession } from "./ocpp/client.js";
 
-export { OCPPEventType } from "./types.js";
-
 export type {
   BodyInput,
   Charger,

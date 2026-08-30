@@ -36,9 +36,9 @@ describe("OCPI", () => {
     await panda.flush();
     await panda.close();
 
-    const [record] = await mock.waitFor(1);
-    expect(mock.received[0].path).toBe("/v1/ocpi");
-    expect(mock.received[0].headers["x-api-key"]).toBe("test-key");
+    const record = (await mock.waitFor(1))[0]!;
+    expect(mock.received[0]!.path).toBe("/v1/ocpi");
+    expect(mock.received[0]!.headers["x-api-key"]).toBe("test-key");
     expect(record).toMatchObject({
       direction: "IN",
       platform_id: "acme",
@@ -77,7 +77,7 @@ describe("OCPI", () => {
     await panda.flush();
     await panda.close();
 
-    const [record] = await mock.waitFor(1);
+    const record = (await mock.waitFor(1))[0]!;
     expect(record.request_headers).toEqual({ accept: "*/*" });
     expect(JSON.parse(b64(record.request_body))).toEqual({ token: "[redacted]" });
   });
@@ -91,7 +91,7 @@ describe("OCPI", () => {
     await panda.flush();
     await panda.close();
 
-    const [record] = await mock.waitFor(1);
+    const record = (await mock.waitFor(1))[0]!;
     expect(record.response_status_code).toBeNull();
     expect(record.request_body).toBeNull();
     expect(record.response_headers).toBeNull();
@@ -109,11 +109,11 @@ describe("OCPP", () => {
     await panda.close();
 
     const records = await mock.waitFor(3);
-    expect(mock.received[0].path).toBe("/v1/ocpp");
+    expect(mock.received[0]!.path).toBe("/v1/ocpp");
     expect(records.map((r) => r.event_type)).toEqual([1, 2, 0]);
-    expect(records[1].direction).toBe("FROM_CP");
-    expect(b64(records[1].raw_frame)).toBe('[2,"1","Heartbeat",{}]');
-    expect(records[0].raw_frame).toBeNull();
+    expect(records[1]!.direction).toBe("FROM_CP");
+    expect(b64(records[1]!.raw_frame)).toBe('[2,"1","Heartbeat",{}]');
+    expect(records[0]!.raw_frame).toBeNull();
     expect(new Set(records.map((r) => r.connection_id)).size).toBe(1);
   });
 
@@ -137,6 +137,25 @@ describe("delivery", () => {
     expect((await mock.waitFor(BATCH_CAP)).length).toBeGreaterThanOrEqual(BATCH_CAP);
     await panda.close();
   });
+
+  it("does not lose the size trigger raised during a flush", async () => {
+    // A batch that fills while a flush is in flight has no trigger of its
+    // own — the producer sees one already running. Go's wake channel holds
+    // that token and Python's Event stays set; this pins the same
+    // behaviour here, rather than falling back to the flush interval.
+    mock.delayMs = 150;
+    const panda = ocppClient(mock, { flushInterval: 3_600_000 });
+    const session = panda.connection(CHARGER);
+
+    const frame = '[2,"1","Heartbeat",{}]';
+    for (let i = 0; i < BATCH_CAP; i++) session.message(frame, "FROM_CP");
+    await new Promise((r) => setTimeout(r, 20)); // flush #1 is now in flight
+    for (let i = 0; i < BATCH_CAP; i++) session.message(frame, "FROM_CP");
+
+    // Both batches must land well inside the (disabled) flush interval.
+    await mock.waitFor(2 * BATCH_CAP, 3_000);
+    await panda.close();
+  }, 20_000);
 
   it("chunks a large backlog at the batch cap", async () => {
     const panda = ocppClient(mock);
@@ -172,7 +191,7 @@ describe("delivery", () => {
     }
     await big.flush();
     await big.close();
-    expect(mock.received[0].headers["content-encoding"]).toBe("zstd");
+    expect(mock.received[0]!.headers["content-encoding"]).toBe("zstd");
 
     const small = ocpiClient(mock);
     small.captureInboundMessage({
@@ -181,7 +200,7 @@ describe("delivery", () => {
     });
     await small.flush();
     await small.close();
-    expect(mock.received[1].headers["content-encoding"]).toBeUndefined();
+    expect(mock.received[1]!.headers["content-encoding"]).toBeUndefined();
   });
 
   it("retries a transient failure", async () => {

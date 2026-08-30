@@ -22,6 +22,8 @@ export interface MockUpstream {
   received: Received[];
   /** Statuses to serve before falling back to 200, one per request. */
   statuses: number[];
+  /** Milliseconds to hold each response, for testing an in-flight flush. */
+  delayMs: number;
   /** Every record from every request, in order. */
   readonly records: Record<string, unknown>[];
   waitFor(count: number, timeoutMs?: number): Promise<Record<string, unknown>[]>;
@@ -32,6 +34,7 @@ export interface MockUpstream {
 export async function startMockUpstream(): Promise<MockUpstream> {
   const received: Received[] = [];
   const statuses: number[] = [];
+  const state = { delayMs: 0 };
 
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -42,6 +45,10 @@ export async function startMockUpstream(): Promise<MockUpstream> {
         buf = Buffer.from(zstdDecompressSync(buf));
       }
       const status = statuses.shift() ?? 200;
+      const respond = (fn: () => void): void => {
+        if (state.delayMs > 0) setTimeout(fn, state.delayMs);
+        else fn();
+      };
       if (status === 200) {
         let records: Record<string, unknown>[] = [];
         try {
@@ -53,12 +60,16 @@ export async function startMockUpstream(): Promise<MockUpstream> {
           /* a malformed body shows up as zero records */
         }
         received.push({ path: req.url ?? "", headers: req.headers, records });
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ captured: records.length, failed: 0 }));
+        respond(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ captured: records.length, failed: 0 }));
+        });
         return;
       }
-      res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "stub" }));
+      respond(() => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "stub" }));
+      });
     });
   });
 
@@ -69,6 +80,12 @@ export async function startMockUpstream(): Promise<MockUpstream> {
     url: `http://127.0.0.1:${port}`,
     received,
     statuses,
+    get delayMs() {
+      return state.delayMs;
+    },
+    set delayMs(ms: number) {
+      state.delayMs = ms;
+    },
     get records() {
       return received.flatMap((r) => r.records);
     },

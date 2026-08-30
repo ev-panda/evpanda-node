@@ -229,7 +229,7 @@ describe("counters", () => {
     const delta = subtract(c.snapshot(7, 99), first);
     expect(delta.droppedEvicted).toBe(2);
     expect(delta.bufferedMessages).toBe(7);
-    expect(logLine(delta)).toBe("droppedEvicted=2 buffered=7 bufferBytes=99");
+    expect(logLine(delta)).toBe("evicted=2 buffered=7 buffer_bytes=99");
   });
 });
 

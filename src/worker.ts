@@ -205,8 +205,18 @@ export class Worker {
     if (!this._stopped && this._buffer.length > 0) {
       await this.flushOnce();
     }
-    // Re-arm only after the flush settles: the worker is never re-entrant,
-    // and every flush restarts the interval because the buffer is empty
+    if (this._stopped) return;
+    // A batch that filled while that flush was in flight raised no trigger
+    // of its own — the producer saw one already running and returned. Go
+    // holds that token in a one-slot wake channel and Python in an Event
+    // that stays set; here the loop re-checks, so a full buffer never waits
+    // out the flush interval.
+    if (this._buffer.length >= BATCH_CAP) {
+      setImmediate(() => void this._tick());
+      return;
+    }
+    // Otherwise re-arm the interval. The worker is never re-entrant, and
+    // every flush restarts the interval because the buffer is empty
     // afterwards whatever triggered it.
     this._schedule();
   }
@@ -242,7 +252,7 @@ export class Worker {
     if (totalDropped(delta) === 0) return;
     try {
       logger.warn(
-        `@evpanda/sdk: captures dropped window=${REPORT_INTERVAL_MS / 1000}s ${logLine(delta)}`,
+        `evpanda: captures dropped window=${REPORT_INTERVAL_MS / 1000}s ${logLine(delta)}`,
       );
     } catch {
       /* a broken host logger is not our failure */
@@ -262,8 +272,8 @@ export class Worker {
     if (lost === 0 && drained && this._config.logMode !== "debug") return;
     const line = `${logLine(total)}${drained ? "" : " drain=incomplete"}`;
     try {
-      if (lost === 0 && drained) logger.info(`@evpanda/sdk: client closed ${line}`);
-      else logger.warn(`@evpanda/sdk: client closed ${line}`);
+      if (lost === 0 && drained) logger.info(`evpanda: client closed ${line}`);
+      else logger.warn(`evpanda: client closed ${line}`);
     } catch {
       /* a broken host logger is not our failure */
     }

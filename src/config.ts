@@ -186,7 +186,7 @@ export const MIN_MAX_BUFFER_BYTES = 64 * 1024;
 export const MIN_FLUSH_INTERVAL = 1;
 export const MIN_DRAIN_TIMEOUT = 5_000;
 
-const ERR = "@evpanda/sdk: config";
+const ERR = "evpanda: config";
 
 // ── Resolution ───────────────────────────────────────────────────────────
 
