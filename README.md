@@ -119,9 +119,12 @@ call returns.
 Bodies travel as UTF-8 text, with `request_body_encoding` and
 `response_body_encoding` naming the encoding alongside them. Both protocols are
 JSON over UTF-8, so that is always `"utf8"` today; the contract reserves
-`"base64"` for payloads that are not text. A body that is not valid UTF-8 is
-dropped rather than shipped as mojibake, and counted in `bodiesDropped` — the
-exchange around it still ships.
+`"base64"` for payloads that are not text.
+
+A message whose body is not valid UTF-8 is dropped rather than shipped as
+mojibake, and counted in `droppedInvalidBody`. The whole message goes, not just
+the body: an exchange that arrives without the payload it describes is harder to
+reason about than one that never arrives.
 
 ## HTTP adapters
 
@@ -288,7 +291,7 @@ safe on an inert or closed client. Each counter maps to one root cause:
 ```ts
 const stats = panda.stats();
 // { captured: 40120, droppedInvalid: 0, droppedOversize: 0, droppedEvicted: 9402,
-//   droppedUndeliverable: 0, droppedFault: 0, bodiesDropped: 0,
+//   droppedInvalidBody: 0, droppedUndeliverable: 0, droppedFault: 0,
 //   bufferedMessages: 2, bufferBytes: 528 }
 ```
 
@@ -299,8 +302,8 @@ const stats = panda.stats();
 | `droppedOversize` | Bodies exceed `maxCaptureBytes` |
 | `droppedEvicted` | Upstream can't keep up, or the buffer is undersized |
 | `droppedUndeliverable` | Network, API key, or ingestion fault |
+| `droppedInvalidBody` | A body or frame that was not valid UTF-8 |
 | `droppedFault` | A bug in the SDK — please report it |
-| `bodiesDropped` | Payloads that were not valid UTF-8, so the body was omitted |
 
 It is a pull-based snapshot, so it feeds Prometheus, OpenTelemetry or a log line
 without the SDK depending on any of them.

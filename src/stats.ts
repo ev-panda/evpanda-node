@@ -19,6 +19,7 @@
 export type DropReason =
   | "none"
   | "invalidIdentity"
+  | "invalidBody"
   | "oversize"
   | "evicted"
   | "undeliverable"
@@ -39,8 +40,8 @@ export type DropReason =
  * | `droppedOversize` | bodies exceed `maxCaptureBytes` |
  * | `droppedEvicted` | upstream can't keep up, or the buffer is undersized |
  * | `droppedUndeliverable` | network, API key, or ingestion fault |
+ * | `droppedInvalidBody` | a body or frame that was not valid UTF-8 |
  * | `droppedFault` | a bug in the SDK; please report it |
- * | `bodiesDropped` | payloads that were not valid UTF-8 |
  */
 export interface Stats {
   /** Messages that passed the chokepoint and entered the buffer. */
@@ -66,18 +67,17 @@ export interface Stats {
   readonly droppedFault: number;
 
   /**
-   * Payloads omitted because they were not valid UTF-8, which the wire
+   * Messages whose body or frame was not valid UTF-8, which the wire
    * contract requires.
    *
-   * It does not count lost messages: an OCPI exchange still ships without
-   * the offending body, carrying its method, URL, status and headers. An
-   * OCPP frame is the exception, since `event_type` 2 requires one, so that
-   * message is dropped as well and counted in `droppedOversize`.
+   * The whole message goes, not just the offending body: an exchange that
+   * arrives without the payload it describes is harder for a consumer to
+   * reason about than one that never arrives.
    *
    * Both protocols are JSON over UTF-8, so any value above zero means
    * something upstream is sending payloads the protocol does not allow.
    */
-  readonly bodiesDropped: number;
+  readonly droppedInvalidBody: number;
 
   /** How many messages are awaiting delivery now. */
   readonly bufferedMessages: number;
@@ -88,6 +88,7 @@ export interface Stats {
 /** The counter each drop reason charges. "none" charges nothing. */
 const FIELD_FOR_REASON: Partial<Record<DropReason, CounterField>> = {
   invalidIdentity: "droppedInvalid",
+  invalidBody: "droppedInvalidBody",
   oversize: "droppedOversize",
   evicted: "droppedEvicted",
   undeliverable: "droppedUndeliverable",
@@ -110,20 +111,12 @@ export class Counters {
     droppedOversize: 0,
     droppedEvicted: 0,
     droppedUndeliverable: 0,
+    droppedInvalidBody: 0,
     droppedFault: 0,
-    bodiesDropped: 0,
   };
 
   countCaptured(): void {
     this._counts.captured++;
-  }
-
-  /**
-   * Charge `n` omitted bodies. Separate from `countDrop` because the
-   * reasons there all cost a whole message.
-   */
-  countBodiesDropped(n: number): void {
-    if (n > 0) this._counts.bodiesDropped += n;
   }
 
   /**
@@ -149,6 +142,7 @@ export function totalDropped(stats: Stats): number {
     stats.droppedOversize +
     stats.droppedEvicted +
     stats.droppedUndeliverable +
+    stats.droppedInvalidBody +
     stats.droppedFault
   );
 }
@@ -166,8 +160,9 @@ export function subtract(current: Stats, previous: Stats): Stats {
     droppedEvicted: current.droppedEvicted - previous.droppedEvicted,
     droppedUndeliverable:
       current.droppedUndeliverable - previous.droppedUndeliverable,
+    droppedInvalidBody:
+      current.droppedInvalidBody - previous.droppedInvalidBody,
     droppedFault: current.droppedFault - previous.droppedFault,
-    bodiesDropped: current.bodiesDropped - previous.bodiesDropped,
     bufferedMessages: current.bufferedMessages,
     bufferBytes: current.bufferBytes,
   };
@@ -182,11 +177,11 @@ export function subtract(current: Stats, previous: Stats): Stats {
 const LOG_KEYS: readonly (readonly [string, keyof Stats])[] = [
   ["captured", "captured"],
   ["invalid_identity", "droppedInvalid"],
+  ["invalid_body", "droppedInvalidBody"],
   ["oversize", "droppedOversize"],
   ["evicted", "droppedEvicted"],
   ["undeliverable", "droppedUndeliverable"],
   ["fault", "droppedFault"],
-  ["bodies_dropped", "bodiesDropped"],
 ];
 
 /**
