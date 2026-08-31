@@ -19,7 +19,12 @@ import { isOCPI } from "./types.js";
 import type { BufferedMessage } from "./buffer.js";
 import type { Logger, ResolvedConfig } from "./config.js";
 import type { Counters } from "./stats.js";
-import type { OCPIMessage, OCPPMessage, Protocol } from "./types.js";
+import type {
+  BodyInput,
+  OCPIMessage,
+  OCPPMessage,
+  Protocol,
+} from "./types.js";
 
 // ── Compression ──────────────────────────────────────────────────────────
 //
@@ -100,8 +105,15 @@ interface OcpiIngest {
   response_status_code: number | null;
   request_headers: Record<string, string> | null;
   request_body: string | null;
+  /**
+   * How `request_body` is encoded: null when there is no body, "utf8"
+   * otherwise. The contract reserves "base64" for payloads that are not
+   * text, which neither protocol produces today.
+   */
+  request_body_encoding: string | null;
   response_headers: Record<string, string> | null;
   response_body: string | null;
+  response_body_encoding: string | null;
 }
 
 interface OcppIngest {
@@ -113,6 +125,8 @@ interface OcppIngest {
   event_type: number;
   direction: string | null;
   raw_frame: string | null;
+  /** How `raw_frame` is encoded, on the same terms as the OCPI bodies. */
+  raw_frame_encoding: string | null;
 }
 
 interface IngestBody {
@@ -128,15 +142,33 @@ function headersJSON(
 }
 
 /**
- * base64-encode a body/frame, or null when empty. Used for every byte
- * payload the SDK ships — OCPI HTTP bodies AND OCPP wire frames. The
- * ingest server decodes before persistence (so DB / consumers see plain
- * UTF-8 for OCPP, raw bytes for OCPI). Rationale: keeps the wire contract
- * uniform across protocols and binary-safe for any future payload.
+ * Render a captured body or frame as the UTF-8 text the wire contract
+ * carries, or null when there is nothing to send.
+ *
+ * No encoding step: both protocols are JSON over UTF-8, so a body is
+ * already text by the time it gets here. The capture chokepoint drops any
+ * body that is not valid UTF-8 (see `prepareOCPI` and `prepareOCPP`), which
+ * is what lets this be a plain decode rather than a lossy one.
  */
-function bodyB64(b: Uint8Array | string | undefined): string | null {
+function bodyText(b: BodyInput | undefined): string | null {
   if (b === undefined || b.length === 0) return null;
-  return Buffer.from(b as Uint8Array).toString("base64");
+  return typeof b === "string" ? b : new TextDecoder().decode(b);
+}
+
+/**
+ * The only body encoding the SDK emits. The contract also defines "base64",
+ * for payloads that are not text; nothing in OCPI 2.2.1 or OCPP 1.6-J
+ * produces one, so the SDK drops such a body rather than encoding it.
+ */
+const ENCODING_UTF8 = "utf8";
+
+/**
+ * Name the encoding of a body, or null when there is no body to describe.
+ * Sending it explicitly keeps the record self-describing: a reader never
+ * has to infer the encoding from the bytes.
+ */
+function bodyEncoding(b: BodyInput | undefined): string | null {
+  return b === undefined || b.length === 0 ? null : ENCODING_UTF8;
 }
 
 /** Non-empty string, or null. */
@@ -161,9 +193,11 @@ function ocpiRecord(e: BufferedMessage, m: OCPIMessage): OcpiIngest {
     url: m.data.url,
     response_status_code: optInt(m.data.statusCode),
     request_headers: headersJSON(m.data.requestHeaders),
-    request_body: bodyB64(m.data.requestBody),
+    request_body: bodyText(m.data.requestBody),
+    request_body_encoding: bodyEncoding(m.data.requestBody),
     response_headers: headersJSON(m.data.responseHeaders),
-    response_body: bodyB64(m.data.responseBody),
+    response_body: bodyText(m.data.responseBody),
+    response_body_encoding: bodyEncoding(m.data.responseBody),
   };
 }
 
@@ -176,14 +210,15 @@ function ocppRecord(e: BufferedMessage, m: OCPPMessage): OcppIngest {
     captured_at: e.capturedAt,
     event_type: m.eventType,
     direction: optStr(m.direction),
-    raw_frame: bodyB64(m.payload),
+    raw_frame: bodyText(m.payload),
+    raw_frame_encoding: bodyEncoding(m.payload),
   };
 }
 
 /**
  * Envelope[] → JSON request body `{"messages":[<record>,...]}`. Each
  * message is mapped to the flat snake_case ingestion record by kind; bodies
- * are base64 of the Uint8Array. Wire shape must match the ingestion service.
+ * travel as UTF-8 text. Wire shape must match the ingestion service.
  */
 function serialize(batch: BufferedMessage[]): Uint8Array {
   const messages: (OcpiIngest | OcppIngest)[] = batch.map((e) =>

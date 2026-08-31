@@ -18,6 +18,7 @@ import { nowISO } from "./buffer.js";
 import { logLine, subtract, totalDropped } from "./stats.js";
 import {
   OCPPEventType,
+  isUTF8,
   ownBody,
   validCharger,
   validPlatform,
@@ -299,7 +300,8 @@ export function prepareOCPI(
   redact: OCPIRedactor | undefined,
   maxCaptureBytes: number,
 ): Prepared {
-  if (!validPlatform(message.platform)) return [undefined, "invalidIdentity"];
+  if (!validPlatform(message.platform))
+    return [undefined, "invalidIdentity"];
 
   const source = message.data;
   const requestBody = ownBody(source.requestBody);
@@ -309,6 +311,15 @@ export function prepareOCPI(
   }
   if ((responseBody?.length ?? 0) > maxCaptureBytes) {
     return [undefined, "oversize"];
+  }
+
+  // A body that is not valid UTF-8 cannot travel: the wire contract carries
+  // it as text, and shipping it anyway would substitute U+FFFD for the
+  // invalid bytes and store corruption. The whole message goes, not just the
+  // body: an exchange that arrives without the payload it describes is
+  // harder for a consumer to reason about than one that never arrives.
+  if (!isUTF8(requestBody) || !isUTF8(responseBody)) {
+    return [undefined, "invalidBody"];
   }
 
   // Take ownership before redacting. From here the exchange is the SDK's,
@@ -344,16 +355,19 @@ export function prepareOCPP(
   redact: OCPPRedactor | undefined,
   maxCaptureBytes: number,
 ): Prepared {
-  if (!validCharger(message.charger)) return [undefined, "invalidIdentity"];
+  if (!validCharger(message.charger))
+    return [undefined, "invalidIdentity"];
 
   const payload = ownBody(message.payload);
-  if ((payload?.length ?? 0) > maxCaptureBytes) return [undefined, "oversize"];
+  if ((payload?.length ?? 0) > maxCaptureBytes)
+    return [undefined, "oversize"];
   if (
     message.eventType === OCPPEventType.Message &&
     (payload === undefined || message.direction === undefined)
   ) {
     return [undefined, "oversize"];
   }
+  if (!isUTF8(payload)) return [undefined, "invalidBody"];
 
   const owned: OCPPMessage = { ...message, payload };
   // undefined is the normal case for OCPP: there is nothing to redact, so

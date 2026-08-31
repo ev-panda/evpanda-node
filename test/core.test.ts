@@ -243,7 +243,10 @@ describe("the OCPI chokepoint", () => {
   it("drops an invalid identity", () => {
     const msg = ocpi();
     msg.platform = { id: "", name: "Acme" };
-    expect(prepareOCPI(msg, undefined, CAP)).toEqual([undefined, "invalidIdentity"]);
+    expect(prepareOCPI(msg, undefined, CAP)).toEqual([
+      undefined,
+      "invalidIdentity",
+    ]);
   });
 
   it.each(["requestBody", "responseBody"])("drops an oversize %s", (field) => {
@@ -319,6 +322,27 @@ describe("the OCPP chokepoint", () => {
     expect(prepareOCPP(ocpp({ payload: undefined }), undefined, CAP)[1]).toBe(
       "oversize",
     );
+    // A frame that is not valid UTF-8 takes the message with it.
+    const [envelope, reason] = prepareOCPP(
+      ocpp({ payload: Uint8Array.from([0xff, 0xfe, 0x00, 0x01]) }),
+      undefined,
+      CAP,
+    );
+    expect(envelope).toBeUndefined();
+    expect(reason).toBe("invalidBody");
+  });
+
+  it("drops an OCPI message whose body is not valid UTF-8", () => {
+    const msg = ocpi();
+    msg.data.requestBody = Uint8Array.from([0xff, 0xfe, 0x00, 0x01]);
+    msg.data.responseBody = '{"status_code":1000}';
+
+    const [envelope, reason] = prepareOCPI(msg, undefined, CAP);
+    expect(envelope).toBeUndefined();
+    expect(reason).toBe("invalidBody");
+  });
+
+  it("reports the OCPP frame direction", () => {
     expect(prepareOCPP(ocpp({ direction: undefined }), undefined, CAP)[1]).toBe(
       "oversize",
     );

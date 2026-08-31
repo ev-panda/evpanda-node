@@ -139,6 +139,25 @@ export interface HTTPExchange {
  * overwritten it. Copying at the chokepoint is what makes the field safe to
  * hand over.
  */
+/**
+ * Whether `bytes` is valid UTF-8, which the wire contract requires of every
+ * body and frame.
+ *
+ * A strict `TextDecoder` is the cheapest correct check: it walks the bytes
+ * once in native code and throws on the first invalid sequence, where a
+ * decode-and-re-encode comparison would allocate twice and still have to
+ * compare.
+ */
+export function isUTF8(bytes: Uint8Array | undefined): boolean {
+  if (bytes === undefined || bytes.length === 0) return true;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function ownBody(value: BodyInput | undefined): Uint8Array | undefined {
   if (value === undefined) return undefined;
   const bytes =

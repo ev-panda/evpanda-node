@@ -116,6 +116,16 @@ panda.captureInboundMessage({
 Bodies are copied at capture, so you can reuse your own buffer the moment the
 call returns.
 
+Bodies travel as UTF-8 text, with `request_body_encoding` and
+`response_body_encoding` naming the encoding alongside them. Both protocols are
+JSON over UTF-8, so that is always `"utf8"` today; the contract reserves
+`"base64"` for payloads that are not text.
+
+A message whose body is not valid UTF-8 is dropped rather than shipped as
+mojibake, and counted in `droppedInvalidBody`. The whole message goes, not just
+the body: an exchange that arrives without the payload it describes is harder to
+reason about than one that never arrives.
+
 ## HTTP adapters
 
 `ocpi` wraps the HTTP layers your service already speaks, so you don't have to
@@ -281,7 +291,8 @@ safe on an inert or closed client. Each counter maps to one root cause:
 ```ts
 const stats = panda.stats();
 // { captured: 40120, droppedInvalid: 0, droppedOversize: 0, droppedEvicted: 9402,
-//   droppedUndeliverable: 0, droppedFault: 0, bufferedMessages: 2, bufferBytes: 528 }
+//   droppedInvalidBody: 0, droppedUndeliverable: 0, droppedFault: 0,
+//   bufferedMessages: 2, bufferBytes: 528 }
 ```
 
 | Counter | What a high value means |
@@ -291,6 +302,7 @@ const stats = panda.stats();
 | `droppedOversize` | Bodies exceed `maxCaptureBytes` |
 | `droppedEvicted` | Upstream can't keep up, or the buffer is undersized |
 | `droppedUndeliverable` | Network, API key, or ingestion fault |
+| `droppedInvalidBody` | A body or frame that was not valid UTF-8 |
 | `droppedFault` | A bug in the SDK — please report it |
 
 It is a pull-based snapshot, so it feeds Prometheus, OpenTelemetry or a log line
@@ -319,10 +331,6 @@ a request path.
 
 ## Documentation
 
-- [Architecture and design notes](https://claude.ai/code/artifact/f214c278-cafd-409e-b1ab-b6a7fb8e7ece)
-  — how it works, and why. The source lives in the Obsidian vault at
-  `engineering/SDKs/design-docs/`, not in this repo: it is knowledge
-  about the code rather than part of what ships
 - [evpanda-go](https://github.com/evpanda-labs/evpanda-go) — the reference
   implementation this SDK tracks
 - [evpanda-py](https://github.com/evpanda-labs/evpanda-py) — the Python SDK,
