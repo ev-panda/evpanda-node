@@ -18,6 +18,7 @@ import { nowISO } from "./buffer.js";
 import { logLine, subtract, totalDropped } from "./stats.js";
 import {
   OCPPEventType,
+  isUTF8,
   ownBody,
   validCharger,
   validPlatform,
@@ -84,11 +85,12 @@ export class Worker {
 
   /** The producer entry point for OCPI; see `prepareOCPI`. */
   captureOCPI(message: OCPIMessage, redact: OCPIRedactor | undefined): void {
-    const [envelope, reason] = prepareOCPI(
+    const [envelope, reason, bodiesDropped] = prepareOCPI(
       message,
       redact,
       this._config.maxCaptureBytes,
     );
+    this._counters.countBodiesDropped(bodiesDropped);
     if (envelope === undefined) {
       this._counters.countDrop(reason);
       return;
@@ -98,11 +100,12 @@ export class Worker {
 
   /** The producer entry point for OCPP; see `prepareOCPP`. */
   captureOCPP(message: OCPPMessage, redact: OCPPRedactor | undefined): void {
-    const [envelope, reason] = prepareOCPP(
+    const [envelope, reason, bodiesDropped] = prepareOCPP(
       message,
       redact,
       this._config.maxCaptureBytes,
     );
+    this._counters.countBodiesDropped(bodiesDropped);
     if (envelope === undefined) {
       this._counters.countDrop(reason);
       return;
@@ -286,7 +289,12 @@ export class Worker {
 // the queue. Pure: they return the envelope to enqueue, or undefined plus
 // the reason the drop belongs to. Callers go through Worker.capture*.
 
-type Prepared = readonly [BufferedMessage | undefined, DropReason];
+type Prepared = readonly [
+  BufferedMessage | undefined,
+  DropReason,
+  /** Bodies omitted because they were not valid UTF-8. */
+  number,
+];
 
 /**
  * Validate the identity, enforce the body cap, take ownership, redact.
@@ -299,16 +307,32 @@ export function prepareOCPI(
   redact: OCPIRedactor | undefined,
   maxCaptureBytes: number,
 ): Prepared {
-  if (!validPlatform(message.platform)) return [undefined, "invalidIdentity"];
+  if (!validPlatform(message.platform))
+    return [undefined, "invalidIdentity", 0];
 
   const source = message.data;
-  const requestBody = ownBody(source.requestBody);
-  const responseBody = ownBody(source.responseBody);
+  let requestBody = ownBody(source.requestBody);
+  let responseBody = ownBody(source.responseBody);
   if ((requestBody?.length ?? 0) > maxCaptureBytes) {
-    return [undefined, "oversize"];
+    return [undefined, "oversize", 0];
   }
   if ((responseBody?.length ?? 0) > maxCaptureBytes) {
-    return [undefined, "oversize"];
+    return [undefined, "oversize", 0];
+  }
+
+  // A body that is not valid UTF-8 cannot travel: the wire contract carries
+  // it as text, and shipping it anyway would substitute U+FFFD for the
+  // invalid bytes and store corruption. Drop the body, keep the exchange:
+  // method, URL, status and headers are still worth having, and the counter
+  // says the body went missing on purpose.
+  let bodiesDropped = 0;
+  if (!isUTF8(requestBody)) {
+    requestBody = undefined;
+    bodiesDropped++;
+  }
+  if (!isUTF8(responseBody)) {
+    responseBody = undefined;
+    bodiesDropped++;
   }
 
   // Take ownership before redacting. From here the exchange is the SDK's,
@@ -330,6 +354,7 @@ export function prepareOCPI(
   return [
     { capturedAt: nowISO(), message: redact ? redact(owned) : owned, size: 0 },
     "none",
+    bodiesDropped,
   ];
 }
 
@@ -344,16 +369,23 @@ export function prepareOCPP(
   redact: OCPPRedactor | undefined,
   maxCaptureBytes: number,
 ): Prepared {
-  if (!validCharger(message.charger)) return [undefined, "invalidIdentity"];
+  if (!validCharger(message.charger))
+    return [undefined, "invalidIdentity", 0];
 
   const payload = ownBody(message.payload);
-  if ((payload?.length ?? 0) > maxCaptureBytes) return [undefined, "oversize"];
+  if ((payload?.length ?? 0) > maxCaptureBytes)
+    return [undefined, "oversize", 0];
   if (
     message.eventType === OCPPEventType.Message &&
     (payload === undefined || message.direction === undefined)
   ) {
-    return [undefined, "oversize"];
+    return [undefined, "oversize", 0];
   }
+  // Unlike an OCPI body, a frame is the whole message: `event_type` 2
+  // requires one, so a frame that is not valid UTF-8 takes the message with
+  // it. It is counted twice on purpose, once as the body that went missing
+  // and once as the message that did.
+  if (!isUTF8(payload)) return [undefined, "oversize", 1];
 
   const owned: OCPPMessage = { ...message, payload };
   // undefined is the normal case for OCPP: there is nothing to redact, so
@@ -361,5 +393,6 @@ export function prepareOCPP(
   return [
     { capturedAt: nowISO(), message: redact ? redact(owned) : owned, size: 0 },
     "none",
+    0,
   ];
 }

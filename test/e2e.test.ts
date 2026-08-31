@@ -24,7 +24,8 @@ afterEach(async () => {
   await mock.close();
 });
 
-const b64 = (v: unknown) => Buffer.from(String(v), "base64").toString("utf8");
+/** A captured body as it arrives on the wire: UTF-8 text. */
+const body = (v: unknown) => String(v);
 
 describe("OCPI", () => {
   it("delivers an inbound exchange intact", async () => {
@@ -49,7 +50,8 @@ describe("OCPI", () => {
       url: "/ocpi/2.2/cdrs",
       response_status_code: 201,
     });
-    expect(b64(record.request_body)).toBe('{"id":"cdr-1"}');
+    expect(body(record.request_body)).toBe('{"id":"cdr-1"}');
+    expect(record.request_body_encoding).toBe("utf8");
     expect(String(record.captured_at)).toMatch(/Z$/);
   });
 
@@ -79,7 +81,7 @@ describe("OCPI", () => {
 
     const record = (await mock.waitFor(1))[0]!;
     expect(record.request_headers).toEqual({ accept: "*/*" });
-    expect(JSON.parse(b64(record.request_body))).toEqual({ token: "[redacted]" });
+    expect(JSON.parse(body(record.request_body))).toEqual({ token: "[redacted]" });
   });
 
   it("serializes absent values as null", async () => {
@@ -112,7 +114,9 @@ describe("OCPP", () => {
     expect(mock.received[0]!.path).toBe("/v1/ocpp");
     expect(records.map((r) => r.event_type)).toEqual([1, 2, 0]);
     expect(records[1]!.direction).toBe("FROM_CP");
-    expect(b64(records[1]!.raw_frame)).toBe('[2,"1","Heartbeat",{}]');
+    expect(body(records[1]!.raw_frame)).toBe('[2,"1","Heartbeat",{}]');
+    expect(records[1]!.raw_frame_encoding).toBe("utf8");
+    expect(records[0]!.raw_frame_encoding).toBeNull();
     expect(records[0]!.raw_frame).toBeNull();
     expect(new Set(records.map((r) => r.connection_id)).size).toBe(1);
   });

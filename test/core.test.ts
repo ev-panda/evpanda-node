@@ -243,7 +243,11 @@ describe("the OCPI chokepoint", () => {
   it("drops an invalid identity", () => {
     const msg = ocpi();
     msg.platform = { id: "", name: "Acme" };
-    expect(prepareOCPI(msg, undefined, CAP)).toEqual([undefined, "invalidIdentity"]);
+    expect(prepareOCPI(msg, undefined, CAP)).toEqual([
+      undefined,
+      "invalidIdentity",
+      0,
+    ]);
   });
 
   it.each(["requestBody", "responseBody"])("drops an oversize %s", (field) => {
@@ -319,6 +323,34 @@ describe("the OCPP chokepoint", () => {
     expect(prepareOCPP(ocpp({ payload: undefined }), undefined, CAP)[1]).toBe(
       "oversize",
     );
+    // A frame that is not valid UTF-8 takes the message with it, and is
+    // counted both as the body that went missing and the message that did.
+    const [envelope, reason, bodiesDropped] = prepareOCPP(
+      ocpp({ payload: Uint8Array.from([0xff, 0xfe, 0x00, 0x01]) }),
+      undefined,
+      CAP,
+    );
+    expect(envelope).toBeUndefined();
+    expect(reason).toBe("oversize");
+    expect(bodiesDropped).toBe(1);
+  });
+
+  it("drops an OCPI body that is not valid UTF-8 but keeps the exchange", () => {
+    const msg = ocpi();
+    msg.data.requestBody = Uint8Array.from([0xff, 0xfe, 0x00, 0x01]);
+    msg.data.responseBody = '{"status_code":1000}';
+
+    const [envelope, reason, bodiesDropped] = prepareOCPI(msg, undefined, CAP);
+    expect(reason).toBe("none");
+    expect(bodiesDropped).toBe(1);
+    expect(envelope!.message.data.requestBody).toBeUndefined();
+    // The good half survives untouched.
+    expect(new TextDecoder().decode(envelope!.message.data.responseBody)).toBe(
+      '{"status_code":1000}',
+    );
+  });
+
+  it("reports the OCPP frame direction", () => {
     expect(prepareOCPP(ocpp({ direction: undefined }), undefined, CAP)[1]).toBe(
       "oversize",
     );

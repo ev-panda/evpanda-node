@@ -40,6 +40,7 @@ export type DropReason =
  * | `droppedEvicted` | upstream can't keep up, or the buffer is undersized |
  * | `droppedUndeliverable` | network, API key, or ingestion fault |
  * | `droppedFault` | a bug in the SDK; please report it |
+ * | `bodiesDropped` | payloads that were not valid UTF-8 |
  */
 export interface Stats {
   /** Messages that passed the chokepoint and entered the buffer. */
@@ -63,6 +64,20 @@ export interface Stats {
    * zero is a bug.
    */
   readonly droppedFault: number;
+
+  /**
+   * Payloads omitted because they were not valid UTF-8, which the wire
+   * contract requires.
+   *
+   * It does not count lost messages: an OCPI exchange still ships without
+   * the offending body, carrying its method, URL, status and headers. An
+   * OCPP frame is the exception, since `event_type` 2 requires one, so that
+   * message is dropped as well and counted in `droppedOversize`.
+   *
+   * Both protocols are JSON over UTF-8, so any value above zero means
+   * something upstream is sending payloads the protocol does not allow.
+   */
+  readonly bodiesDropped: number;
 
   /** How many messages are awaiting delivery now. */
   readonly bufferedMessages: number;
@@ -96,10 +111,19 @@ export class Counters {
     droppedEvicted: 0,
     droppedUndeliverable: 0,
     droppedFault: 0,
+    bodiesDropped: 0,
   };
 
   countCaptured(): void {
     this._counts.captured++;
+  }
+
+  /**
+   * Charge `n` omitted bodies. Separate from `countDrop` because the
+   * reasons there all cost a whole message.
+   */
+  countBodiesDropped(n: number): void {
+    if (n > 0) this._counts.bodiesDropped += n;
   }
 
   /**
@@ -143,6 +167,7 @@ export function subtract(current: Stats, previous: Stats): Stats {
     droppedUndeliverable:
       current.droppedUndeliverable - previous.droppedUndeliverable,
     droppedFault: current.droppedFault - previous.droppedFault,
+    bodiesDropped: current.bodiesDropped - previous.bodiesDropped,
     bufferedMessages: current.bufferedMessages,
     bufferBytes: current.bufferBytes,
   };
@@ -161,6 +186,7 @@ const LOG_KEYS: readonly (readonly [string, keyof Stats])[] = [
   ["evicted", "droppedEvicted"],
   ["undeliverable", "droppedUndeliverable"],
   ["fault", "droppedFault"],
+  ["bodies_dropped", "bodiesDropped"],
 ];
 
 /**
